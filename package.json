@@ -1,6 +1,6 @@
 {
   "name": "hivetop",
-  "version": "0.1.0",
+  "version": "1.8.0",
   "description": "An htop-like terminal monitor for the Hive blockchain.",
   "license": "CC0-1.0",
   "repository": {
