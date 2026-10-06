@@ -214,8 +214,8 @@ export function parseArgs(args) {
             index += 1;
         }
         else if (arg === "--view" && value) {
-            if (value !== "blocks" && value !== "round" && value !== "txstatus")
-                throw new Error("--view must be blocks, round, or txstatus");
+            if (value !== "blocks" && value !== "round" && value !== "txstatus" && value !== "sizes")
+                throw new Error("--view must be blocks, round, txstatus, or sizes");
             options.view = value;
             index += 1;
         }
@@ -253,7 +253,7 @@ function printHelp() {
 
 Usage:
   hivetop [--node URL] [--start BLOCK] [--window SECONDS] [--poll-ms MS]
-          [--view blocks|round|txstatus] [--compact] [--ascii] [--no-color]
+          [--view blocks|round|txstatus|sizes] [--compact] [--ascii] [--no-color]
           [--rpc-timeout-ms MS]
   hivetop --follow [--node URL] [--start BLOCK] [--poll-ms MS] [--limit NUM]
 
@@ -275,7 +275,7 @@ Controls:
   q, Ctrl-C  Quit
   p          Pause/resume
   r          Reset to current head
-  v          Cycle blocks, witness round, transaction status (defrag)
+  v          Cycle blocks, witness round, transaction status (defrag), sizes
   arrows/j/k Select rows; PageUp/PageDown moves a page; Home/g follows live
   Enter      Inspect the selected produced block
   /          Filter by witness name; Enter applies; Esc clears/closes

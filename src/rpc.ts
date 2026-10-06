@@ -2,6 +2,7 @@ import type {
   AppliedOperation,
   DynamicGlobalProperties,
   HiveBlock,
+  HiveTransaction,
   NextScheduledHardfork,
   RcStatsResponse,
   TransactionRef,
@@ -32,6 +33,7 @@ export interface HiveRpcReadable {
   readonly health?: { lastResponseAt?: number; latencyMs?: number };
   getDynamicGlobalProperties(signal?: AbortSignal): Promise<DynamicGlobalProperties>;
   getBlock(blockNumber: number, signal?: AbortSignal): Promise<HiveBlock | null>;
+  getBlockSize?(blockNumber: number, signal?: AbortSignal): Promise<number | undefined>;
   getVirtualOperationsInBlock(blockNumber: number, signal?: AbortSignal): Promise<AppliedOperation[]>;
   getHardforkVersion(signal?: AbortSignal): Promise<string>;
   getNextScheduledHardfork(signal?: AbortSignal): Promise<NextScheduledHardfork>;
@@ -69,6 +71,25 @@ export class HiveRpcClient implements HiveRpcReadable {
 
   async getBlock(blockNumber: number, signal?: AbortSignal): Promise<HiveBlock | null> {
     return this.call<HiveBlock | null>("condenser_api.get_block", [blockNumber], signal);
+  }
+
+  async getBlockSize(blockNumber: number, signal?: AbortSignal): Promise<number | undefined> {
+    const block = await this.getBlock(blockNumber, signal);
+    if (!block) return undefined;
+    const headerBytes = signedBlockHeaderBytes(block);
+    const transactions = block.transactions ?? [];
+    let transactionBytes = 0;
+    if (transactions.length) {
+      const envelopes = transactions.reduce((total, transaction) => total + transactionEnvelopeBytes(transaction), 0);
+      // Pack all operations once. Their encodings are independent of transaction boundaries.
+      // This is a serialization query; the synthetic transaction is never broadcast.
+      const combined = { ...transactions[0], operations: transactions.flatMap((transaction) => transaction.operations ?? []), extensions: [], signatures: [] };
+      const hex = await this.call<string>("condenser_api.get_transaction_hex", [combined], signal);
+      if (typeof hex !== "string" || !/^(?:[0-9a-f]{2})+$/i.test(hex)) throw new Error("Invalid serialized transaction hex");
+      transactionBytes = hex.length / 2 - transactionEnvelopeBytes(combined) + envelopes;
+      if (transactionBytes < envelopes) throw new Error("Incomplete serialized transaction hex");
+    }
+    return headerBytes + varUintBytes(transactions.length) + transactionBytes;
   }
 
   async getVirtualOperationsInBlock(blockNumber: number, signal?: AbortSignal): Promise<AppliedOperation[]> {
@@ -218,6 +239,11 @@ export class FailoverHiveRpcClient implements HiveRpcReadable {
     return this.withStableEndpoint((client) => client.getBlock(blockNumber, signal), signal);
   }
 
+  async getBlockSize(blockNumber: number, signal?: AbortSignal): Promise<number | undefined> {
+    if (!this.current.getBlockSize) throw new Error("Block-size measurements are unavailable on this node");
+    return this.current.getBlockSize(blockNumber, signal);
+  }
+
   async getVirtualOperationsInBlock(blockNumber: number, signal?: AbortSignal): Promise<AppliedOperation[]> {
     return this.withStableEndpoint((client) => client.getVirtualOperationsInBlock(blockNumber, signal), signal);
   }
@@ -286,6 +312,37 @@ export function withStableEndpoint<T>(client: HiveRpcReadable, read: (client: Hi
 
 function defaultFetch(url: string, init: RpcRequestInit): Promise<RpcResponse> {
   return globalThis.fetch(url, init) as unknown as Promise<RpcResponse>;
+}
+
+function signedBlockHeaderBytes(block: HiveBlock): number {
+  if (!/^[0-9a-f]{40}$/i.test(block.previous ?? "") || !/^[0-9a-f]{40}$/i.test(block.transaction_merkle_root ?? "")
+    || !/^[0-9a-f]{130}$/i.test(block.witness_signature ?? "")) throw new Error("Incomplete signed block header");
+  const witnessBytes = Buffer.byteLength(block.witness, "utf8");
+  const extensions = block.extensions ?? [];
+  let extensionBytes = varUintBytes(extensions.length);
+  for (const extension of extensions) {
+    // Hive's header variants are void, version (uint32), and hardfork vote (version + timestamp).
+    if (!Array.isArray(extension) || ![0, 1, 2].includes(extension[0])) throw new Error("Unsupported block header extension");
+    extensionBytes += 1 + [0, 4, 8][extension[0]];
+  }
+  // Previous ID, timestamp, witness string, merkle root, extensions, compact signature.
+  return 20 + 4 + varUintBytes(witnessBytes) + witnessBytes + 20 + extensionBytes + 65;
+}
+
+function varUintBytes(value: number): number {
+  let bytes = 1;
+  while (value >= 128) { value = Math.floor(value / 128); bytes++; }
+  return bytes;
+}
+
+function transactionEnvelopeBytes(transaction: HiveTransaction): number {
+  const signatures = transaction.signatures ?? [];
+  if (signatures.some((signature) => !/^[0-9a-f]{130}$/i.test(signature))) throw new Error("Invalid transaction signature");
+  const extensions = transaction.extensions ?? [];
+  if (extensions.some((extension) => !Array.isArray(extension) || extension[0] !== 0)) throw new Error("Unsupported transaction extension");
+  // ref_block_num (uint16), ref_block_prefix + expiration (uint32), vectors, signatures.
+  return 10 + varUintBytes(transaction.operations?.length ?? 0) + varUintBytes(extensions.length) + extensions.length
+    + varUintBytes(signatures.length) + 65 * signatures.length;
 }
 
 function responseHeaders(response: RpcResponse): RpcHeaders {

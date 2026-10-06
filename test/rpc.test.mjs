@@ -30,6 +30,34 @@ test("HiveRpcClient sends virtual operation requests", async () => {
   assert.deepEqual(requests[0].params, [123, true]);
 });
 
+test("block sizes include envelopes and signatures while serializing operations in one request", async () => {
+  const block = { previous: "00".repeat(20), timestamp: "2026-10-06T00:00:00", witness: "alice",
+    transaction_merkle_root: "00".repeat(20), witness_signature: "00".repeat(65), extensions: [], transactions: [] };
+  const requests = [];
+  const client = new HiveRpcClient("https://example.test", async (_url, init) => {
+    const request = JSON.parse(init.body);
+    requests.push(request);
+    if (request.method === "condenser_api.get_block") return response({ result: block });
+    const ops = request.params[0].operations;
+    const countBytes = ops.length < 128 ? 1 : 2;
+    return response({ result: "00".repeat(10 + countBytes + 2 + ops.length * 2) });
+  });
+  assert.equal(await client.getBlockSize(1), 117);
+  assert.equal(requests.length, 1); // Empty blocks need no serialization RPC.
+  block.extensions = [[0, {}], [1, "1.28.0"], [2, { hf_version: "1.28.0", hf_time: "2026-10-06T00:00:00" }]];
+  block.transactions = Array.from({ length: 128 }, () => ({ operations: [["vote", {}]], signatures: ["00".repeat(65)], extensions: [] }));
+  assert.equal(await client.getBlockSize(2), 117 + 15 + 1 + 128 * (13 + 65 + 2));
+  assert.equal(requests[2].method, "condenser_api.get_transaction_hex");
+  assert.equal(requests[2].params[0].operations.length, 128);
+  assert.deepEqual(requests[2].params[0].signatures, []);
+  block.witness = "é".repeat(64); // UTF-8 string byte length crosses the varuint boundary.
+  block.transactions = [];
+  block.extensions = [];
+  assert.equal(await client.getBlockSize(3), 117 - 5 + 128 + 1);
+  block.extensions = [[3, {}]];
+  await assert.rejects(client.getBlockSize(4), /Unsupported block header extension/);
+});
+
 test("HiveRpcClient sends hardfork version requests", async () => {
   const requests = [];
   const client = new HiveRpcClient("https://example.test", async (_url, init) => {

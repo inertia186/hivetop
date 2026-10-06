@@ -12,6 +12,7 @@ Requires **Node 24 or newer**. With nvm, run `nvm use` in this directory
 ```bash
 npm start
 npm start -- --view round
+npm start -- --view sizes
 npm start -- --view txstatus --compact --ascii
 npm start -- --node https://api.hive.blog
 npm start -- --start 98765432
@@ -20,11 +21,28 @@ npm start -- --follow --node https://api.hive.blog --limit 42
 NO_COLOR=1 npm start
 ```
 
-The three views are blocks, the witness schedule (`round`), and transaction
-status (`txstatus`, the defrag view). `--view` chooses the starting view.
+The four views are blocks, the witness schedule (`round`), transaction
+status (`txstatus`, the defrag view), and block-size history (`sizes`).
+`--view` chooses the starting view.
 The witness view previews the announced next round and marks the current round
 with `>`, its block range, and progress. Its live position keeps the latest
 produced block visible alongside predictions.
+
+The `sizes` view plots uncompressed serialized block bytes over the rolling
+`--window` (120 seconds by default), oldest on the left and newest on the right.
+It shows the latest measured size, mean, minimum, and peak. The vertical scale
+adapts to the peak in the window; axes use KiB (1024 bytes) and UTC time.
+Blocks sharing a chart column use their peak size. Empty or unmeasured slots
+stay blank. `--ascii` uses `#` for the filled chart.
+
+Size measurements run in the background only while this view is visible.
+Each block needs an extra block fetch and one `get_transaction_hex` call;
+operations are serialized together, with the original transaction headers,
+signatures, signed block header, and transaction count included in the total.
+Backfilling is limited to at most one measurement per second.
+The measured/total block count shows progress while recent history fills in.
+Failures appear in the view and event history, retry after 30 seconds, and
+leave block tracking running. Measured sizes remain available in block details.
 
 `--compact` hides the sidebar and reduces the number of columns. Narrow terminals
 adapt automatically. `--ascii` replaces graphical status cells with distinct
@@ -71,7 +89,7 @@ Keyboard controls:
 - `q` or `Ctrl-C`: quit
 - `p`: pause/resume rendering and block fetching
 - `r`: reset the follower to the current head block
-- `v`: cycle blocks, witness round, and transaction status
+- `v`: cycle blocks, witness round, transaction status, and block sizes
 - Arrow keys / `j` / `k`: select a row (`*` marks the selection)
 - PageUp / PageDown: move by a page; Home / `g`: return to live rows
 - Enter: inspect the selected produced block, its transactions, and operation counts

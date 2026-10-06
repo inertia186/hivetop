@@ -3,6 +3,8 @@ export type HiveOperation = [type: string, payload: unknown];
 export interface HiveTransaction {
   expiration?: string;
   operations?: HiveOperation[];
+  extensions?: unknown[];
+  signatures?: string[];
 }
 
 export interface HiveBlock {
@@ -10,6 +12,7 @@ export interface HiveBlock {
   timestamp: string;
   witness: string;
   transaction_merkle_root?: string;
+  witness_signature?: string;
   extensions?: unknown[];
   transaction_ids?: string[];
   transactions?: HiveTransaction[];
@@ -167,6 +170,7 @@ export interface BlockRecord {
   number: number;
   timestamp: Date;
   witness: string;
+  sizeBytes?: number;
   transactionCount: number;
   transactions: TransactionRef[];
   operationCount: number;

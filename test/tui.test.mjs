@@ -3,6 +3,7 @@ import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { stripVTControlCharacters as stripAnsi } from "node:util";
 import {
+  blockSizeChartLines,
   clampedScrollStart,
   formatFeedAge,
   formatMaintenanceCountdown,
@@ -54,6 +55,84 @@ test("headerSummary keeps normal live status stable", () => {
     ),
     "view txstatus  |  head 101",
   );
+});
+
+test("block-size charts preserve time gaps and peaks, support filtering, and fit their row budget", () => {
+  const blocks = [
+    { ...blockRecord(4), timestamp: new Date("2026-10-06T00:00:12Z"), sizeBytes: 1024, witness: "bob" },
+    { ...blockRecord(1), timestamp: new Date("2026-10-06T00:00:03Z"), sizeBytes: 256, witness: "alice" },
+  ];
+  const lines = blockSizeChartLines(blocks, 12, 10, 22);
+  assert.equal(lines.length, 10);
+  assert.equal(lines[7], "         |███      ███");
+  assert.match(lines[1], /Latest 1.0 KiB \| Mean 640 B/);
+  assert.match(lines[2], /Min 256 B \| Peak 1.0 KiB \| 2\/2 blocks/);
+  const merged = blockSizeChartLines(blocks, 12, 10, 11, true);
+  assert.equal(merged[3], " 1.0 KiB |#"); // One column keeps the larger sample.
+  const filtered = blockSizeChartLines(blocks, 12, 10, 30, true, "alice");
+  assert.match(filtered[1], /Latest 256 B \| Mean 256 B/);
+  assert.match(filtered[9], /00:00:00.*00:00:12/); // Filtering keeps the same time axis.
+  assert.equal(blockSizeChartLines(blocks, 12, 3, 22).length, 3);
+  assert.match(blockSizeChartLines([], 12, 10, 22)[1], /Waiting/);
+  const boundary = { ...blockRecord(0), timestamp: new Date("2026-10-06T00:00:00Z"), sizeBytes: 8192 };
+  assert.ok(blockSizeChartLines([...blocks, boundary], 12, 10, 22)[3].endsWith(" ".repeat(12)));
+  assert.equal(/[^\x00-\x7f]/.test(filtered.join("\n")), false);
+});
+
+test("size measurements run only in their view, cancel on leaving, cache results, and back off on errors", async () => {
+  await sleep(1); // Let earlier test reports flush before intercepting terminal output.
+  const originalWrite = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk) => { output = String(chunk); return true; };
+  const requests = [];
+  const ui = new TerminalUi({ node: "test", windowSeconds: 120, onQuit() {}, onPauseToggle() {}, onReset() {},
+    transactionStatusClient: { getBlockSize(number, signal) {
+      return new Promise((resolve, reject) => requests.push({ number, signal, resolve, reject }));
+    } } });
+  const block = { ...blockRecord(104), timestamp: new Date() };
+  const event = { type: "block", block, headBlock: 104, lag: 0,
+    dynamicGlobalProperties: { head_block_number: 104, time: block.timestamp.toISOString() },
+    witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] };
+  const snapshot = { blocks: [block], blockRate: 0, transactionRate: 0, operationRate: 0, virtualOperationRate: 0, operationTypes: [], witnesses: [] };
+  const openSizes = () => { ui.onKey("v"); ui.onKey("v"); ui.onKey("v"); };
+  try {
+    ui.render(event, snapshot);
+    assert.equal(requests.length, 0);
+    openSizes();
+    assert.equal(requests.length, 1);
+    ui.onKey("v");
+    assert.equal(requests[0].signal.aborted, true);
+    requests[0].resolve(128);
+    await sleep(1);
+    assert.equal(block.sizeBytes, undefined);
+    openSizes();
+    requests[1].resolve(256);
+    await sleep(1);
+    assert.equal(block.sizeBytes, 256);
+    ui.render(event, snapshot);
+    assert.equal(requests.length, 2);
+    assert.match(output, /Latest 256 B/);
+    const newer = { ...blockRecord(105), timestamp: new Date() };
+    ui.render({ ...event, block: newer }, { ...snapshot, blocks: [newer, block] });
+    assert.equal(requests.length, 2); // Backfilling waits at least one second after success.
+    ui.sizeRetryAt = 0;
+    ui.render({ ...event, block: newer }, { ...snapshot, blocks: [newer, block] });
+    requests[2].reject(new Error("Serialization API unavailable"));
+    await sleep(1);
+    assert.match(output, /Size RPC: Serialization API unavailable/);
+    ui.render(event, { ...snapshot, blocks: [newer, block] });
+    assert.equal(requests.length, 3);
+    assert.equal(block.sizeBytes, 256);
+    ui.sizeRetryAt = 0;
+    ui.render(event, { ...snapshot, blocks: [newer, block] });
+    assert.equal(requests.length, 4);
+    ui.stop();
+    assert.equal(requests[3].signal.aborted, true);
+    const stoppedOutput = output;
+    requests[3].resolve(512);
+    await sleep(1);
+    assert.equal(output, stoppedOutput);
+  } finally { ui.stop(); process.stdout.write = originalWrite; }
 });
 
 test("headerSummary includes only useful deltas and issues", () => {
@@ -480,8 +559,10 @@ test("TransactionStatusMonitor groups work without batching while the visible wi
   monitor.stop();
 });
 
-test("TransactionStatusMonitor uses batch only after retained blocks fall behind the visible window", async () => {
+test("TransactionStatusMonitor uses batch only after retained blocks fall behind the visible window", { timeout: 1000 }, async (context) => {
   const batches = [];
+  let batchReady;
+  const batched = new Promise((resolve) => { batchReady = resolve; });
   const monitor = new TransactionStatusMonitor(
     {
       async findTransaction(transactionId) {
@@ -489,6 +570,7 @@ test("TransactionStatusMonitor uses batch only after retained blocks fall behind
       },
       async findTransactions(transactions) {
         batches.push(transactions.map((transaction) => transaction.id));
+        batchReady();
         return transactions.map((transaction) => ({
           status: "within_reversible_block",
           block_num: transaction.id.startsWith("vote-") ? 101 : 102,
@@ -502,6 +584,7 @@ test("TransactionStatusMonitor uses batch only after retained blocks fall behind
     0,
     8,
   );
+  context.after(() => monitor.stop());
 
   monitor.sync(
     {
@@ -516,10 +599,9 @@ test("TransactionStatusMonitor uses batch only after retained blocks fall behind
     () => {},
   );
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
-  await sleep(2);
+  await batched;
 
   assert.deepEqual(batches[0], ["vote-2", "vote-3"]);
-  monitor.stop();
 });
 
 test("TransactionStatusMonitor falls back to single requests when escalated batch is unsupported", async () => {
@@ -1236,9 +1318,9 @@ test("ASCII/NO_COLOR views fit small terminals and keep status distinctions", ()
     for (const [columns, rows] of [[48, 18], [80, 24], [160, 50]]) {
       Object.defineProperty(process.stdout, "columns", { configurable: true, value: columns });
       Object.defineProperty(process.stdout, "rows", { configurable: true, value: rows });
-      for (const view of ["blocks", "round", "txstatus"]) {
+      for (const view of ["blocks", "round", "txstatus", "sizes"]) {
         const ui = new TerminalUi({ node: "test", windowSeconds: 120, view, ascii: true, noColor: true, onQuit() {}, onPauseToggle() {}, onReset() {}, transactionStatusClient: { async findTransaction() { return { status: "within_irreversible_block" }; } } });
-        const block = { ...blockRecord(104, [{ id: "tx1" }, { id: "tx2" }]), timestamp: new Date(), witness: "bob" };
+        const block = { ...blockRecord(104, [{ id: "tx1" }, { id: "tx2" }]), timestamp: new Date(), witness: "bob", sizeBytes: 512 };
         try {
           ui.render({ type: "block", block, headBlock: 104, lag: 0, dynamicGlobalProperties: { head_block_number: 104, current_aslot: 103, time: block.timestamp.toISOString() }, witnessSchedule: { current_shuffled_witnesses: ["alice", "bob", "carol"], future_shuffled_witnesses: ["dan", "erin", "frank"], next_shuffle_block_num: 105 }, witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] },
             { blocks: [block], blockRate: 0.3, transactionRate: 1, operationRate: 2, virtualOperationRate: 0, operationTypes: [], witnesses: [] });

@@ -25,6 +25,9 @@ export class TerminalUi {
     notice = "";
     noColor;
     txStatusMonitor;
+    sizeAbort;
+    sizeError = "";
+    sizeRetryAt = 0;
     scheduleTracker = new WitnessScheduleTracker();
     get displayedRoundSchedule() { return this.scheduleTracker.schedule; }
     get displayedRoundScheduleMinBlock() { return this.scheduleTracker.minBlockNumber; }
@@ -70,6 +73,7 @@ export class TerminalUi {
         this.stopRetractTimer();
         this.stopSpinnerTimer();
         this.txStatusMonitor?.stop();
+        this.sizeAbort?.abort();
         if (process.stdin.isTTY)
             process.stdin.setRawMode(false);
         process.stdin.pause();
@@ -269,6 +273,7 @@ export class TerminalUi {
         const tableRows = Math.max(1, tableBudget - (this.view === "round" ? 4 : this.view === "txstatus" ? 5 : 1));
         this.tableCapacity = tableRows;
         const selection = { selectedBlock: this.selectedBlock, witnessFilter: this.witnessFilter, blockNumbers: [], scroll: this.scroll };
+        this.measureBlockSizes();
         let tableLines;
         if (this.overlay) {
             const content = this.overlay === "help" ? helpLines()
@@ -283,6 +288,11 @@ export class TerminalUi {
         }
         else if (this.view === "txstatus") {
             tableLines = txStatusTableLines(this.txStatusMonitor, this.scroll, tableRows, mainWidth, selection, Boolean(this.options.ascii || this.noColor));
+        }
+        else if (this.view === "sizes") {
+            tableLines = blockSizeChartLines(snapshot.blocks, this.options.windowSeconds, tableBudget - (this.sizeError ? 1 : 0), mainWidth, Boolean(this.options.ascii), this.witnessFilter);
+            if (this.sizeError)
+                tableLines.splice(1, 0, `Size RPC: ${this.sizeError}`);
         }
         else {
             tableLines = blockTableLines(dataEvent, snapshot.blocks, this.scroll, tableRows, mainWidth, selection, compact);
@@ -307,6 +317,38 @@ export class TerminalUi {
     }
     nodeLabel() {
         return typeof this.options.node === "function" ? this.options.node() : this.options.node;
+    }
+    measureBlockSizes() {
+        if (this.view !== "sizes" || this.overlay) {
+            this.sizeAbort?.abort();
+            return;
+        }
+        if (this.sizeAbort || Date.now() < this.sizeRetryAt)
+            return;
+        const block = this.latestSnapshot?.blocks.find((candidate) => candidate.sizeBytes === undefined && candidate.witness.includes(this.witnessFilter));
+        if (!block)
+            return;
+        const client = this.options.transactionStatusClient;
+        if (!client?.getBlockSize) {
+            this.sizeError = "Block-size API unavailable";
+            return;
+        }
+        const abort = this.sizeAbort = new AbortController();
+        void client.getBlockSize(block.number, abort.signal).then((size) => {
+            if (abort.signal.aborted)
+                return;
+            if (size === undefined || !Number.isFinite(size) || size < 0)
+                throw new Error(`Size unavailable for block ${block.number}`);
+            block.sizeBytes = size;
+            this.sizeError = "";
+            this.sizeRetryAt = Date.now() + 1000; // Keep backfilling history below one measurement per second.
+        }).catch((error) => {
+            if (abort.signal.aborted)
+                return;
+            this.sizeError = error instanceof Error ? error.message : String(error);
+            this.sizeRetryAt = Date.now() + 30_000;
+            this.addEvent(`Block-size RPC: ${this.sizeError}`);
+        }).finally(() => { this.sizeAbort = undefined; this.draw(); });
     }
     updateDisplayedRoundSchedule(event, blocks) {
         this.scheduleTracker.update(dynamicGlobalProperties(event), witnessSchedule(event), blocks, event.missedBlocks);
@@ -441,6 +483,8 @@ function nextView(view) {
         return "round";
     if (view === "round")
         return "txstatus";
+    if (view === "txstatus")
+        return "sizes";
     return "blocks";
 }
 export class TransactionStatusMonitor {
@@ -768,10 +812,58 @@ function isTransactionStatusApiUnavailable(error, message) {
         return false;
     return /unknown api|method not found|could not find api|does not exist|no method with name/i.test(message);
 }
+export function blockSizeChartLines(blocks, windowSeconds, rows, width, ascii = false, witnessFilter = "") {
+    const filtered = blocks.filter((block) => block.witness.includes(witnessFilter));
+    const measured = filtered.filter((block) => Number.isFinite(block.sizeBytes) && block.sizeBytes >= 0);
+    const lines = ["BLOCK SIZE (bytes)"];
+    if (!measured.length)
+        return [...lines, "Waiting for block-size measurements..."].slice(0, rows);
+    const values = measured.map((block) => block.sizeBytes);
+    const peak = Math.max(...values);
+    const latest = measured.reduce((a, b) => a.number > b.number ? a : b);
+    lines.push(`Latest ${formatBytes(latest.sizeBytes)} | Mean ${formatBytes(values.reduce((a, b) => a + b, 0) / values.length)}`, `Min ${formatBytes(Math.min(...values))} | Peak ${formatBytes(peak)} | ${measured.length}/${filtered.length} blocks`);
+    if (rows < 6)
+        return lines.slice(0, rows);
+    const height = rows - 5;
+    const columns = Math.max(1, width - 10);
+    const end = Math.max(...blocks.map((block) => block.timestamp.getTime()));
+    const duration = Math.max(1, windowSeconds) * 1000;
+    const start = end - duration;
+    const scale = Math.max(1024, Math.ceil(peak / 1024) * 1024);
+    const buckets = Array(columns).fill(undefined);
+    // A block covers the three-second slot ending at its timestamp. Empty slots stay blank.
+    // When several blocks share a column, keep the peak rather than hide a size spike.
+    for (const block of measured) {
+        const time = block.timestamp.getTime();
+        if (time <= start || time > end)
+            continue;
+        const left = Math.max(0, Math.min(columns - 1, Math.floor((time - 3000 - start) / duration * columns)));
+        const right = Math.max(left + 1, Math.min(columns, Math.ceil((time - start) / duration * columns)));
+        for (let column = left; column < right; column++)
+            buckets[column] = Math.max(buckets[column] ?? 0, block.sizeBytes);
+    }
+    for (let row = 0; row < height; row++) {
+        const label = row === 0 || row === Math.floor(height / 2) ? formatBytes(scale * (height - row) / height) : "";
+        const cells = buckets.map((size) => {
+            const parts = size === undefined ? 0 : Math.ceil(size / scale * height * 8);
+            const fill = Math.max(0, Math.min(8, parts - (height - row - 1) * 8));
+            return ascii ? (fill ? "#" : " ") : " ▁▂▃▄▅▆▇█"[fill];
+        }).join("");
+        lines.push(`${label.padStart(8)} |${cells}`);
+    }
+    lines.push(`${"0 B".padStart(8)} +${"-".repeat(columns)}`);
+    const firstTime = new Date(start).toISOString().slice(11, 19);
+    const lastTime = new Date(end).toISOString().slice(11, 19);
+    lines.push(`${"UTC".padStart(8)}  ${columns >= 17 ? firstTime + " ".repeat(columns - 16) + lastTime : lastTime.padStart(columns)}`);
+    return lines;
+}
+function formatBytes(bytes) {
+    return bytes < 1024 ? `${Math.round(bytes)} B` : `${(bytes / 1024).toFixed(1)} KiB`;
+}
 function helpLines() {
     return [
         "HELP / LEGENDS (Esc returns; arrows scroll)", "",
-        "v        Cycle blocks, witness round, transaction status",
+        "v        Cycle blocks, round, transaction status, sizes",
         "Up/Down  Select a row (j/k also work)",
         "PgUp/Dn  Move one page; Home/g returns to live rows",
         "Enter    Inspect a produced block; Esc closes details",
@@ -789,6 +881,8 @@ function helpLines() {
         "ASCII/NO_COLOR: * checking, I irreversible, R reversible,",
         ". pending, ? unknown, M mempool, E expired, T old, ! mismatch",
         "Stretched cells share one transaction's status.", "",
+        "Sizes: time runs left to right; vertical scale adapts.",
+        "Empty slots stay blank; combined columns show the peak.", "",
         "STALE: no fresh head/data for 15 seconds.",
         "RECONNECTING: the block RPC failed; retry is in progress.",
         "Cached rates describe the last received block window.",
@@ -801,6 +895,7 @@ function blockDetailLines(block, monitor) {
     return [
         `BLOCK ${block.number} (Esc returns; arrows scroll)`,
         `Witness: ${block.witness} | UTC: ${block.timestamp.toISOString()}`,
+        ...(block.sizeBytes === undefined ? [] : [`Serialized size: ${block.sizeBytes} bytes (${formatBytes(block.sizeBytes)})`]),
         `Transactions: ${block.transactionCount} | Operations: ${block.operationCount} | Virtual: ${block.virtualOperationCount}`,
         "", "OPERATIONS",
         ...[...block.operationTypes].sort((a, b) => b[1] - a[1]).map(([type, count]) => `${type}: ${count}`),

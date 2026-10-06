@@ -75,6 +75,7 @@ test("CLI accepts terminal options and rejects invalid views/timeouts", () => {
   assert.equal(options.compact, true);
   assert.equal(options.noColor, true);
   assert.equal(options.rpcTimeoutMs, 2500);
+  assert.equal(parseArgs(["--view", "sizes"]).view, "sizes");
   assert.throws(() => parseArgs(["--view", "invalid"]), /--view/);
   assert.throws(() => parseArgs(["--rpc-timeout-ms", "0"]), /positive integer/);
 });
