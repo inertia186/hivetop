@@ -267,6 +267,39 @@ test("formatRankedWitnessCell styles the full padded witness column", () => {
   );
 });
 
+test("round rows highlight the specific version or feed difference", () => {
+  const originalWrite = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk) => { output = String(chunk); return true; };
+  const names = ["fresh", "old", "stale", "expired", "unknown"];
+  const blocks = names.map((witness, index) => ({ ...blockRecord(index + 1), witness })).reverse();
+  const snapshot = { blocks, blockRate: 0, transactionRate: 0, operationRate: 0, virtualOperationRate: 0, operationTypes: [], witnesses: [] };
+  const event = { type: "block", block: blocks[0], headBlock: 5, lag: 0, missedBlocks: [],
+    dynamicGlobalProperties: { head_block_number: 5, current_aslot: 4, time: "2026-06-16T12:00:00" },
+    witnessSchedule: { current_shuffled_witnesses: names, next_shuffle_block_num: 5 },
+    witnessRanks: Object.fromEntries(names.map((name, index) => [name, index + 1])),
+    witnessVersions: { fresh: "1.28.7", old: "1.28.3", stale: "1.28.7", expired: "1.28.3" }, majorityWitnessVersion: "1.28.7",
+    witnessFeedUpdates: { fresh: "2026-06-16T06:00:00", old: "2026-06-16T11:00:00", stale: "2026-06-16T05:59:00", expired: "2026-06-15T12:00:00" } };
+  const ui = new TerminalUi({ node: "test", windowSeconds: 120, view: "round", noColor: false, onQuit() {}, onPauseToggle() {}, onReset() {} });
+  const row = (name) => output.split("\n").find((line) => stripAnsi(line).includes(`#${names.indexOf(name) + 1} ${name}`));
+  try {
+    ui.render(event, snapshot);
+    assert.match(row("old"), /\x1b\[1;33;7m1\.28\.3 {3}\x1b\[0m/);
+    assert.doesNotMatch(row("old"), /\x1b\[1;33;7m {2}1h00/);
+    assert.match(row("stale"), /\x1b\[1;33;7m {2}6h01\x1b\[0m/);
+    assert.doesNotMatch(row("stale"), /\x1b\[1;33;7m1\.28\.7/);
+    assert.match(row("expired"), /\x1b\[1;33;7m1\.28\.3/);
+    assert.match(row("expired"), /\x1b\[1;31;7m {2}24h\+\x1b\[0m/);
+    assert.doesNotMatch(row("fresh"), /\x1b\[1;(33|31);7m/);
+    assert.doesNotMatch(row("unknown"), /\x1b\[1;(33|31);7m/);
+    ui.render({ ...event, majorityWitnessVersion: undefined }, snapshot);
+    assert.doesNotMatch(row("old"), /\x1b\[1;33;7m1\.28\.3/);
+    ui.noColor = true;
+    ui.render(event, snapshot);
+    assert.doesNotMatch(output, /\x1b\[[0-9;]*m/);
+  } finally { ui.stop(); process.stdout.write = originalWrite; }
+});
+
 test("formatProducedStatus summarizes produced row state", () => {
   assert.equal(formatProducedStatus({ blockNumber: 1, scheduledWitness: "alice" }), "-");
   assert.equal(formatProducedStatus({ blockNumber: 1, scheduledWitness: "settling", settling: true }), "?");

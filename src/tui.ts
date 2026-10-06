@@ -875,7 +875,9 @@ function helpLines(): string[] {
     "Round status: +/check = produced as scheduled; x = missed",
     "? = unverified; - = predicted; spinner = next block",
     "Witness color: green feed <=6h, yellow <24h, red >=24h",
-    "Inverted witness: running the majority version", "",
+    "Inverted witness: running the majority version",
+    "VERSION: yellow highlight when different from majority",
+    "FEED: yellow highlight >6h, red highlight >=24h", "",
     "Transaction colors: cyan checking, green irreversible,",
     "white reversible, yellow pending/unknown, red expired/old",
     "ASCII/NO_COLOR: * checking, I irreversible, R reversible,",
@@ -1091,9 +1093,20 @@ function roundTableLines(
     );
     const producedStatus = formatRoundProducedStatus(row, displayHeadBlock, spinnerFrame, event.missedBlocks);
     const producedStatusCell = formatProducedStatusCell(producedStatus, 8);
+    const version = row.settling ? undefined : event.witnessVersions[row.scheduledWitness];
+    let versionCell = formatVersion(version).padEnd(9);
+    if (version && event.majorityWitnessVersion && version !== event.majorityWitnessVersion) {
+      versionCell = ansiStyle(versionCell, "orange", true);
+    }
+    const feedUpdate = row.settling ? undefined : event.witnessFeedUpdates[row.scheduledWitness];
+    const freshness = priceFeedFreshness(feedUpdate, chainTime(event));
+    let feedCell = formatFeedAge(feedUpdate, chainTime(event)).padStart(6);
+    if (freshness === "stale" || freshness === "expired") {
+      feedCell = ansiStyle(feedCell, freshness === "stale" ? "orange" : "red", true);
+    }
     lines.push(
       fit(
-        `${roundMarker}${selectionMarker}${String(row.blockNumber).padEnd(11)} ${fit(scheduled, witnessWidth)} ${producedStatusCell}${compact ? "" : ` ${formatVersion(row.settling ? undefined : event.witnessVersions[row.scheduledWitness]).padEnd(9)} ${formatFeedAge(row.settling ? undefined : event.witnessFeedUpdates[row.scheduledWitness], chainTime(event)).padStart(6)}`}`,
+        `${roundMarker}${selectionMarker}${String(row.blockNumber).padEnd(11)} ${fit(scheduled, witnessWidth)} ${producedStatusCell}${compact ? "" : ` ${versionCell} ${feedCell}`}`,
         width,
       ),
     );

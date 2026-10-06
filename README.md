@@ -110,6 +110,9 @@ ASCII transaction legend: `*` checking, `I` irreversible, `R` reversible,
 Stretched cells share one transaction's status. In the witness view, `√` (ASCII
 `+`) means the expected witness produced, `x` means a miss backed by chain
 evidence, and `?` means the schedule is unverified.
+The VERSION cell is highlighted yellow when it differs from the majority
+witness version. The FEED cell is highlighted yellow after 6 hours and red
+at 24 hours, so the reason for a witness's different appearance is visible.
 
 ## Development
 
