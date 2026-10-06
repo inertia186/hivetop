@@ -257,4 +257,3 @@ export function latestProducedBlockNumber(blocks: BlockRecord[]): number | undef
 export function positiveModulo(value: number, divisor: number): number {
   return ((value % divisor) + divisor) % divisor;
 }
-
