@@ -1,10 +1,15 @@
 # hivetop
 
+![hivetop logo](logo.png)
+
+[![Tests](https://github.com/inertia186/hivetop/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/inertia186/hivetop/actions/workflows/test.yml)
+[![CC0-1.0](https://img.shields.io/badge/license-CC0--1.0-lightgrey.svg)](LICENSE)
+
 `hivetop` is an htop-like terminal monitor for the Hive blockchain.
 
 It follows blocks through Hive JSON-RPC, aggregates recent block/transaction/operation rates, and renders a live terminal dashboard.
 
-## Usage
+## Installation
 
 Requires **Node 24 or newer**. With nvm, run `nvm install 24`.
 
@@ -21,6 +26,9 @@ Or run it without a global install:
 npx hivetop
 ```
 
+## Usage
+
+Run `hivetop --help` for command-line options.
 Run `hivetop` from any directory. Examples:
 
 ```bash
@@ -127,6 +135,32 @@ The VERSION cell is highlighted yellow when it differs from the majority
 witness version. The FEED cell is highlighted yellow after 6 hours and red
 at 24 hours, so the reason for a witness's different appearance is visible.
 
+## Troubleshooting
+
+### The `hivetop` command is not found
+
+With nvm, global commands belong to the selected Node installation. Run
+`nvm use 24`, then `npm install --global hivetop`. For a local checkout, run
+`npm link` from the repository instead.
+
+### Colors or status cells look wrong
+
+Try `hivetop --ascii --no-color`. For cramped layouts, add `--compact`.
+When reporting display problems, include your terminal app, font, and a
+screenshot, since rendering can differ between terminals.
+
+### The dashboard shows `STALE` or `RECONNECTING`
+
+Press `e` to inspect recent RPC errors and node changes. Automatic node
+selection retries requests and fails over when needed; an explicit `--node`
+pins the endpoint. Restart without `--node` to restore automatic selection.
+
+For a short diagnostic capture:
+
+```bash
+hivetop --follow --limit 5
+```
+
 ## Development
 
 The runtime is dependency-free and checked into `dist/` so it can run without installing packages. TypeScript source lives in `src/`; after installing dependencies, `npm run build` regenerates `dist/`.
@@ -152,6 +186,17 @@ GitHub Actions runs the tests on Node 24 and verifies that rebuilding does not
 change the checked-in `dist/` files. Run `npm ci` after cloning to install the
 development tools. Runtime dependencies are provided by Node itself.
 
+## Contributing
+
+Bug reports, feature requests, and pull requests are welcome on
+[GitHub](https://github.com/inertia186/hivetop). When
+[opening an issue](https://github.com/inertia186/hivetop/issues), include the
+command you ran, your Node version (`node --version`), and steps to reproduce
+the problem.
+
+Before submitting a pull request, run `npm test`. It rebuilds `dist/` before
+running the tests; include any regenerated runtime files with source changes.
+
 ## Publishing
 
 From this repository with Node 24 or newer:
@@ -163,9 +208,15 @@ npm publish --access public
 ```
 
 Publishing builds the runtime and runs the tests first. The package includes
-only `dist/`, `package.json`, this README, and the license. Use
+only `dist/`, `package.json`, this README, the logo, and the license. Use
 `npm pack --dry-run` to review the file list before publishing.
+
+## Get in touch!
+
+If you're using hivetop, I'd love to hear from you. Drop me a line and tell me
+what you think! I'm [@inertia](https://hive.blog/@inertia) on Hive.
 
 ## License
 
-[CC0 1.0 Universal](LICENSE).
+I don't believe in intellectual "property". If you do, consider hivetop as
+licensed under [Creative Commons CC0 1.0 Universal](LICENSE).

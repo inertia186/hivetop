@@ -12,7 +12,8 @@
     "hivetop": "./dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "logo.png"
   ],
   "scripts": {
     "start": "node ./dist/cli.js",
