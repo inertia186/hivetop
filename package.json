@@ -1,0 +1,23 @@
+{
+  "name": "hivetop",
+  "version": "0.1.0",
+  "description": "An htop-like terminal monitor for the Hive blockchain.",
+  "type": "module",
+  "bin": {
+    "hivetop": "./dist/cli.js"
+  },
+  "scripts": {
+    "start": "node ./dist/cli.js",
+    "dev": "node ./dist/cli.js",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs",
+    "build": "tsc -p tsconfig.json && node ./scripts/make-cli-executable.mjs"
+  },
+  "engines": {
+    "node": ">=16.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^16.18.0",
+    "typescript": "^5.8.0"
+  }
+}
