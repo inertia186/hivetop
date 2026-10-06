@@ -1,4 +1,5 @@
 import { stripVTControlCharacters as stripAnsi } from "node:util";
+import { emitKeypressEvents, type Key } from "node:readline";
 import type {
   BlockRecord,
   DynamicGlobalProperties,
@@ -13,6 +14,8 @@ import type {
   WitnessSchedule,
   WitnessVersions,
 } from "./types.js";
+import { WitnessScheduleTracker, latestProducedBlockNumber, positiveModulo, roundRowsOptions, scheduleSignature, schedulePredictionsExpired, scheduledRoundRows, type ScheduledRoundRow } from "./schedule.js";
+export { rememberScheduleSignature, schedulePredictionsExpired, scheduledRoundRows } from "./schedule.js";
 import type { MetricsSnapshot } from "./metrics.js";
 import { HiveRpcError, type HiveRpcReadable } from "./rpc.js";
 
@@ -20,21 +23,41 @@ interface TerminalUiOptions {
   node: string | (() => string);
   windowSeconds: number;
   transactionStatusClient?: HiveRpcReadable;
+  view?: TerminalView;
+  ascii?: boolean;
+  compact?: boolean;
+  noColor?: boolean;
   onQuit: () => void;
   onPauseToggle: (paused: boolean) => void;
   onReset: () => void;
 }
 
-type TerminalView = "blocks" | "round" | "txstatus";
+export type TerminalView = "blocks" | "round" | "txstatus";
 
 export class TerminalUi {
   private paused = false;
   private scroll = 0;
   private view: TerminalView = "blocks";
+  private stopped = false;
+  private healthTimer: ReturnType<typeof setInterval> | undefined;
+  private lastDataReceivedAt: number | undefined;
+  private previousState = "CONNECTING";
+  private previousEndpoint: string | undefined;
+  private readonly eventHistory: Array<{ time: number; message: string }> = [];
+  private selectedBlock: number | undefined;
+  private tableBlockNumbers: number[] = [];
+  private tableCapacity = 10;
+  private witnessFilter = "";
+  private searchInput: string | undefined;
+  private overlay: "help" | "events" | "detail" | undefined;
+  private overlayScroll = 0;
+  private detailBlock: BlockRecord | undefined;
+  private notice = "";
+  private readonly noColor: boolean;
   private readonly txStatusMonitor: TransactionStatusMonitor | undefined;
-  private displayedRoundSchedule: WitnessSchedule | undefined;
-  private displayedRoundScheduleMinBlock: number | undefined;
-  private readonly acceptedRoundScheduleSignatures = new Map<string, number>();
+  private readonly scheduleTracker = new WitnessScheduleTracker();
+  private get displayedRoundSchedule(): WitnessSchedule | undefined { return this.scheduleTracker.schedule; }
+  private get displayedRoundScheduleMinBlock(): number | undefined { return this.scheduleTracker.minBlockNumber; }
   private readonly observedRoundRows = new Map<number, ScheduledRoundRow>();
   private roundRevealKey = "";
   private revealedFutureRows = 0;
@@ -52,34 +75,57 @@ export class TerminalUi {
   private readonly startedAt = Date.now();
 
   constructor(private readonly options: TerminalUiOptions) {
+    this.view = options.view ?? "blocks";
+    this.noColor = options.noColor ?? Boolean(process.env.NO_COLOR);
     this.txStatusMonitor = options.transactionStatusClient ? new TransactionStatusMonitor(options.transactionStatusClient) : undefined;
   }
 
   start(): void {
+    emitKeypressEvents(process.stdin);
     process.stdin.setEncoding("utf8");
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.resume();
-    process.stdin.on("data", this.onKey);
-    process.stdout.write("\x1b[?25l\x1b[2J");
+    process.stdin.on("keypress", this.onKey);
+    process.stdout.on("resize", this.onResize);
+    process.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[HConnecting to Hive...  q quit");
+    this.healthTimer = setInterval(() => this.draw(), 1000);
   }
 
   stop(): void {
-    process.stdin.off("data", this.onKey);
+    this.stopped = true;
+    process.stdin.off("keypress", this.onKey);
+    process.stdout.off("resize", this.onResize);
+    if (this.healthTimer) clearInterval(this.healthTimer);
     this.stopRevealTimer();
     this.stopRetractTimer();
     this.stopSpinnerTimer();
     this.txStatusMonitor?.stop();
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
-    process.stdout.write("\x1b[?25h\x1b[0m\x1b[2J\x1b[H");
+    process.stdout.write("\x1b[?25h\x1b[0m\x1b[?1049l");
   }
 
   render(event: FollowerEvent, snapshot: MetricsSnapshot): void {
+    if (this.stopped) return;
+    const previous = this.latestEvent;
+    const oldMisses = new Set((previous?.missedBlocks ?? []).map((miss) => `${miss.detectedAtBlock}:${miss.witness}`));
+    for (const miss of event.missedBlocks) {
+      if (!oldMisses.has(`${miss.detectedAtBlock}:${miss.witness}`)) this.addEvent(`Missed block ${miss.detectedAtBlock}: ${miss.witness}`);
+    }
+    if (event.type === "retry" && (previous?.type !== "retry" || previous.message !== event.message)) this.addEvent(`RPC interrupted: ${event.message}`);
+    if (event.type === "gap") this.addEvent(`Waiting for block ${event.blockNumber}`);
+    if (event.scheduleDiagnostics && event.scheduleDiagnostics.changedAtBlock !== previous?.scheduleDiagnostics?.changedAtBlock) {
+      this.addEvent(`Block ${event.scheduleDiagnostics.changedAtBlock}: ${event.scheduleDiagnostics.message}`);
+    }
+    for (const [panel, error] of Object.entries(event.panelErrors ?? {})) {
+      if (error.message !== previous?.panelErrors?.[panel as keyof NonNullable<FollowerEvent["panelErrors"]>]?.message) this.addEvent(`${panel} unavailable/stale: ${error.message}`);
+    }
     this.latestEvent = event;
     this.latestSnapshot = snapshot;
     this.txStatusMonitor?.sync(snapshot, () => this.draw());
 
     if ("dynamicGlobalProperties" in event) {
+      this.lastDataReceivedAt = Date.now();
       this.latestDataEvent = event;
       this.updateDisplayedRoundSchedule(event, snapshot.blocks);
       this.recordObservedRoundRow(event, snapshot.blocks);
@@ -89,10 +135,42 @@ export class TerminalUi {
     this.draw();
   }
 
-  private readonly onKey = (chunk: string): void => {
-    if (chunk === "q" || chunk === "\u0003") {
+  private readonly onResize = (): void => { this.draw(); };
+
+  private readonly onKey = (chunk: string, key?: Key): void => {
+    chunk = key?.sequence ?? chunk ?? "";
+    if (chunk === "\u0003" || (chunk === "q" && this.searchInput === undefined)) {
       this.options.onQuit();
       return;
+    }
+    if (this.searchInput !== undefined) {
+      if (chunk === "\r" || chunk === "\n") {
+        this.witnessFilter = this.searchInput.trim().toLowerCase();
+        this.searchInput = undefined;
+        this.selectedBlock = undefined;
+        this.scroll = 0;
+      } else if (chunk === "\u001b") this.searchInput = undefined;
+      else if (chunk === "\u007f" || chunk === "\b") this.searchInput = this.searchInput.slice(0, -1);
+      else if (/^[a-zA-Z0-9.\- ]+$/.test(chunk)) this.searchInput = (this.searchInput + chunk).slice(0, 64);
+      this.draw();
+      return;
+    }
+    if (chunk === "?" || chunk === "e") {
+      const overlay = chunk === "?" ? "help" : "events";
+      this.overlay = this.overlay === overlay ? undefined : overlay;
+      this.overlayScroll = 0;
+    } else if (chunk === "\u001b") {
+      if (this.overlay) this.overlay = undefined;
+      else { this.witnessFilter = ""; this.selectedBlock = undefined; this.scroll = 0; }
+      this.notice = "";
+    } else if (chunk === "/") {
+      this.searchInput = this.witnessFilter;
+      this.overlay = undefined;
+    } else if (chunk === "\r" || chunk === "\n") {
+      const number = this.selectedBlock ?? this.latestSnapshot?.blocks.find((block) => this.tableBlockNumbers.includes(block.number))?.number;
+      this.detailBlock = [...(this.latestSnapshot?.blocks ?? []), ...(this.txStatusMonitor?.displayBlocks() ?? [])].find((block) => block.number === number);
+      if (this.detailBlock) { this.overlay = "detail"; this.overlayScroll = 0; }
+      else this.notice = "Block details become available after production.";
     }
     if (chunk === "p") {
       this.paused = !this.paused;
@@ -101,6 +179,9 @@ export class TerminalUi {
       return;
     }
     if (chunk === "r") {
+      this.selectedBlock = undefined;
+      this.scroll = 0;
+      this.overlay = undefined;
       this.options.onReset();
       this.draw();
       return;
@@ -108,87 +189,112 @@ export class TerminalUi {
     if (chunk === "v") {
       this.view = nextView(this.view);
       this.scroll = 0;
+      this.selectedBlock = undefined;
+      this.overlay = undefined;
       this.updateSpinnerTimer();
       this.draw();
       return;
     }
-    if (chunk === "\u001b[A") this.scroll = Math.max(0, this.scroll - 1);
-    if (chunk === "\u001b[B") this.scroll += 1;
-    if (chunk === "\u001b[5~") this.scroll = Math.max(0, this.scroll - 10);
-    if (chunk === "\u001b[6~") this.scroll += 10;
+    const delta = chunk === "\u001b[A" || chunk === "k" ? -1 : chunk === "\u001b[B" || chunk === "j" ? 1
+      : chunk === "\u001b[5~" ? -this.tableCapacity : chunk === "\u001b[6~" ? this.tableCapacity : 0;
+    if (delta) {
+      if (this.overlay) this.overlayScroll = Math.max(0, this.overlayScroll + delta);
+      else {
+        const index = this.selectedBlock === undefined ? this.scroll : Math.max(0, this.tableBlockNumbers.indexOf(this.selectedBlock)) + delta;
+        this.selectedBlock = this.tableBlockNumbers[Math.max(0, Math.min(this.tableBlockNumbers.length - 1, index))];
+      }
+    }
+    if (key?.name === "home" || chunk === "g") { this.selectedBlock = undefined; this.scroll = 0; this.overlayScroll = 0; }
     this.draw();
   };
 
+  private addEvent(message: string): void {
+    if (this.eventHistory[0]?.message === message) return;
+    this.eventHistory.unshift({ time: Date.now(), message });
+    this.eventHistory.length = Math.min(100, this.eventHistory.length);
+  }
+
+  private connectionState(now = Date.now()): string {
+    if (this.paused) return "PAUSED";
+    if (this.latestEvent?.type === "retry") return "RECONNECTING";
+    if (this.lastDataReceivedAt === undefined) return "CONNECTING";
+    const props = this.latestDataEvent && dynamicGlobalProperties(this.latestDataEvent);
+    const chainTime = props ? parseHiveUtcTime(props.time)?.getTime() : undefined;
+    if (now - this.lastDataReceivedAt > 15_000 || (chainTime !== undefined && now - chainTime > 15_000)) return "STALE";
+    if (this.latestEvent?.type === "gap") return "WAITING FOR BLOCK";
+    if (this.latestEvent && "lag" in this.latestEvent && this.latestEvent.lag > 0) return "CATCHING UP";
+    return "LIVE";
+  }
+
   private draw(): void {
-    if (!this.latestSnapshot || !this.latestEvent) return;
-    const columns = process.stdout.columns || 100;
-    const rows = process.stdout.rows || 30;
+    if (this.stopped || !this.latestSnapshot || !this.latestEvent) return;
+    const columns = Math.max(20, process.stdout.columns || 100);
+    const rows = Math.max(6, process.stdout.rows || 30);
+    const now = Date.now();
     const snapshot = this.latestSnapshot;
     const statusEvent = this.latestEvent;
     const dataEvent = this.latestDataEvent ?? statusEvent;
-    const status = headerSummary(statusEvent, this.view);
-    const panelWidth = columns >= 100 ? Math.min(40, Math.max(32, Math.floor(columns * 0.34))) : 0;
-    const gutterWidth = panelWidth > 0 ? 3 : 0;
-    const mainWidth = columns - panelWidth - gutterWidth;
-    const tableRows = Math.max(5, rows - 13);
-    const mainLines: string[] = [];
-    const panelLines = panelWidth > 0 ? dynamicPropertiesPanel(dataEvent, panelWidth) : [];
-
-    mainLines.push(color(" HIVEtop ", "white", "red") + " " + status.padEnd(Math.max(0, mainWidth - 10)));
-    mainLines.push(
-      [
-        `node ${this.nodeLabel()}`,
-        `window ${this.options.windowSeconds}s`,
-        `uptime ${formatDuration(Date.now() - this.startedAt)}`,
-        this.paused ? "PAUSED" : "LIVE",
-      ].join("  |  "),
-    );
-    mainLines.push(
-      [
-        `blocks/s ${snapshot.blockRate.toFixed(2)}`,
-        `tx/s ${snapshot.transactionRate.toFixed(2)}`,
-        `ops/s ${snapshot.operationRate.toFixed(2)}`,
-        `vops/s ${snapshot.virtualOperationRate.toFixed(2)}`,
-        `view ${this.view}`,
-      ].join("  |  "),
-    );
-    mainLines.push(horizontal(mainWidth));
-
-    if (this.view === "round") {
-      mainLines.push(
-        ...roundTableLines(
-          dataEvent,
-          snapshot.blocks,
-          this.displayedRoundSchedule,
-          this.displayedRoundScheduleMinBlock,
-          this.observedRoundRows,
-          this.revealedFutureRows,
-          this.retractingPredictedRows,
-          this.spinnerFrame,
-          this.scroll,
-          tableRows,
-          mainWidth,
-        ),
-      );
-    } else if (this.view === "txstatus") {
-      mainLines.push(...txStatusTableLines(this.txStatusMonitor, this.scroll, tableRows, mainWidth));
-    } else {
-      mainLines.push(...blockTableLines(dataEvent, snapshot.blocks, this.scroll, tableRows, mainWidth));
+    const state = this.connectionState(now);
+    if (state !== this.previousState) { this.addEvent(`Connection: ${this.previousState} -> ${state}`); this.previousState = state; }
+    const endpoint = this.nodeLabel();
+    if (endpoint !== this.previousEndpoint) {
+      this.addEvent(this.previousEndpoint ? `Node switched: ${this.previousEndpoint} -> ${endpoint}` : `Using node: ${endpoint}`);
+      this.previousEndpoint = endpoint;
     }
-
-    while (mainLines.length < tableRows + 5) mainLines.push("");
+    const panelWidth = !this.options.compact && columns >= 120 ? Math.min(40, Math.floor(columns * 0.3)) : 0;
+    const mainWidth = columns - (panelWidth ? panelWidth + 3 : 0);
+    const compact = Boolean(this.options.compact || mainWidth < 70);
+    const panelLines = panelWidth ? dynamicPropertiesPanel(dataEvent, panelWidth) : [];
+    const health = this.options.transactionStatusClient?.health;
+    const lastBlock = snapshot.blocks[0];
+    const blockAge = lastBlock ? `${Math.max(0, Math.floor((now - lastBlock.timestamp.getTime()) / 1000))}s ago` : "waiting";
+    const rpcAge = health?.lastResponseAt === undefined ? "" : ` / ${Math.max(0, Math.floor((now - health.lastResponseAt) / 1000))}s ago`;
+    const mainLines = [
+      color(" HIVEtop ", "white", "red") + " " + headerSummary(statusEvent, this.view),
+      `${state} | block ${blockAge} | RPC ${health?.latencyMs === undefined ? "-" : `${health.latencyMs}ms`}${rpcAge}`,
+      `node ${endpoint} | window ${this.options.windowSeconds}s | uptime ${formatDuration(now - this.startedAt)}`,
+      `${state === "STALE" || state === "RECONNECTING" || state === "PAUSED" ? "cached " : ""}blk/s ${snapshot.blockRate.toFixed(2)} | tx/s ${snapshot.transactionRate.toFixed(2)} | ops/s ${snapshot.operationRate.toFixed(2)}${compact ? "" : ` | vops/s ${snapshot.virtualOperationRate.toFixed(2)}`}`,
+    ];
+    const errors = Object.keys(statusEvent.panelErrors ?? {});
+    if (errors.length) mainLines.push(`Unavailable/stale: ${errors.join(", ")} (? help, e events)`);
+    if (this.witnessFilter) mainLines.push(`Witness filter: ${this.witnessFilter} (Esc clears)`);
     mainLines.push(horizontal(mainWidth));
-    mainLines.push(fit(`Top ops: ${snapshot.operationTypes.slice(0, 5).map(([name, count]) => `${name}:${count}`).join("  ") || "none"}`, mainWidth));
-    mainLines.push(fit(`Witnesses: ${snapshot.witnesses.slice(0, 5).map(([name, count]) => `${name}:${count}`).join("  ") || "none"}`, mainWidth));
-    mainLines.push(horizontal(mainWidth));
-    mainLines.push(fit("q quit  p pause/resume  r reset-to-head  v view  ↑/↓ scroll  PgUp/PgDn page", mainWidth));
-
-    const lines = mainLines.map((line, index) => {
-      if (panelWidth === 0) return fit(line, columns);
-      return `${fit(line, mainWidth)}   ${fit(panelLines[index] ?? "", panelWidth)}`;
-    });
-
-    process.stdout.write("\x1b[H" + lines.slice(0, rows).map((line) => fit(line, columns)).join("\n") + "\x1b[J");
+    const controls = this.searchInput !== undefined ? `/ Witness: ${this.searchInput}_ (Enter applies, Esc cancels)`
+      : this.notice || (compact ? "q quit  v view  / find  Enter inspect  ? help  e events" : "q quit  p pause  r head  v view  / witness  Enter inspect  ? help  e events");
+    const footer = [horizontal(mainWidth), `Top ops: ${snapshot.operationTypes.slice(0, 4).map(([name, count]) => `${name}:${count}`).join("  ") || "none"}`,
+      `Witnesses: ${snapshot.witnesses.slice(0, 5).map(([name, count]) => `${name}:${count}`).join("  ") || "none"}`, controls];
+    const tableBudget = Math.max(1, rows - mainLines.length - footer.length);
+    const tableRows = Math.max(1, tableBudget - (this.view === "round" ? 4 : this.view === "txstatus" ? 5 : 1));
+    this.tableCapacity = tableRows;
+    const selection: TableSelection = { selectedBlock: this.selectedBlock, witnessFilter: this.witnessFilter, blockNumbers: [], scroll: this.scroll };
+    let tableLines: string[];
+    if (this.overlay) {
+      const content = this.overlay === "help" ? helpLines()
+        : this.overlay === "events" ? ["EVENT HISTORY (UTC, newest first; up to 100)", ...this.eventHistory.map((event) => `${new Date(event.time).toISOString().slice(11, 19)} ${event.message}`)]
+        : blockDetailLines(this.detailBlock, this.txStatusMonitor);
+      const wrapped = content.flatMap((line) => wrapLine(line, mainWidth));
+      this.overlayScroll = Math.min(this.overlayScroll, Math.max(0, wrapped.length - tableBudget));
+      tableLines = wrapped.slice(this.overlayScroll, this.overlayScroll + tableBudget);
+    } else if (this.view === "round") {
+      tableLines = roundTableLines(dataEvent, snapshot.blocks, this.displayedRoundSchedule, this.displayedRoundScheduleMinBlock,
+        this.observedRoundRows, this.revealedFutureRows, this.retractingPredictedRows, this.spinnerFrame,
+        this.scroll, tableRows, mainWidth, selection, compact);
+    } else if (this.view === "txstatus") {
+      tableLines = txStatusTableLines(this.txStatusMonitor, this.scroll, tableRows, mainWidth, selection, Boolean(this.options.ascii || this.noColor));
+    } else {
+      tableLines = blockTableLines(dataEvent, snapshot.blocks, this.scroll, tableRows, mainWidth, selection, compact);
+    }
+    if (!this.overlay) { this.tableBlockNumbers = selection.blockNumbers; this.scroll = selection.scroll; }
+    mainLines.push(...tableLines.slice(0, tableBudget));
+    while (mainLines.length < rows - footer.length) mainLines.push("");
+    mainLines.push(...footer);
+    let output = mainLines.slice(0, rows).map((line, index) => {
+      const main = fit(line, mainWidth);
+      return panelWidth ? `${main}   ${fit(panelLines[index] ?? "", panelWidth)}` : main;
+    }).join("\n");
+    if (this.noColor) output = stripAnsi(output);
+    if (this.options.ascii) output = output.replace(/√/g, "+").replace(/─/g, "-").replace(/↑/g, "^").replace(/↓/g, "v").replace(/…/g, "~").replace(/[^\x00-\x7f]/g, "?");
+    process.stdout.write("\x1b[H" + output + "\x1b[J");
   }
 
   private nodeLabel(): string {
@@ -196,44 +302,7 @@ export class TerminalUi {
   }
 
   private updateDisplayedRoundSchedule(event: FollowerEvent, blocks: BlockRecord[]): void {
-    const props = dynamicGlobalProperties(event);
-    const candidate = witnessSchedule(event);
-    if (!props || !candidate?.current_shuffled_witnesses?.length) return;
-    const displayHeadBlock = latestProducedBlockNumber(blocks) ?? props.head_block_number;
-    if (!this.displayedRoundSchedule) {
-      this.acceptDisplayedRoundSchedule(candidate, displayHeadBlock);
-      return;
-    }
-    const currentSignature = scheduleSignature(this.displayedRoundSchedule);
-    const candidateSignature = scheduleSignature(candidate);
-    const previousShuffle = this.displayedRoundSchedule.next_shuffle_block_num;
-    const nextShuffle = candidate.next_shuffle_block_num;
-    if (previousShuffle !== undefined && nextShuffle !== undefined && nextShuffle < previousShuffle) return;
-    const advancesRound = previousShuffle !== undefined && nextShuffle !== undefined && nextShuffle > previousShuffle;
-    // The boundary block is still produced by the old schedule.
-    if (advancesRound && displayHeadBlock <= previousShuffle!) return;
-    if (currentSignature === candidateSignature && !advancesRound) {
-      this.displayedRoundSchedule = candidate;
-      return;
-    }
-    if (advancesRound && candidateSignature === (this.displayedRoundSchedule.future_shuffled_witnesses ?? []).join("\n")) {
-      this.acceptDisplayedRoundSchedule(candidate, previousShuffle! + 1);
-      return;
-    }
-    if (!advancesRound && currentSignature !== candidateSignature && this.acceptedRoundScheduleSignatures.has(candidateSignature)) return;
-    const fit = bestScheduleFit(
-      displayHeadBlock, candidate.current_shuffled_witnesses, blocks, event.missedBlocks,
-      previousShuffle === undefined ? this.displayedRoundScheduleMinBlock : previousShuffle + 1,
-    );
-    if (fit.matches >= 3 && fit.newestMatchBlock === displayHeadBlock) {
-      this.acceptDisplayedRoundSchedule(candidate, previousShuffle === undefined ? displayHeadBlock : previousShuffle + 1);
-    }
-  }
-
-  private acceptDisplayedRoundSchedule(schedule: WitnessSchedule, minBlock: number): void {
-    this.displayedRoundSchedule = schedule;
-    this.displayedRoundScheduleMinBlock = minBlock;
-    rememberScheduleSignature(this.acceptedRoundScheduleSignatures, scheduleSignature(schedule), minBlock);
+    this.scheduleTracker.update(dynamicGlobalProperties(event), witnessSchedule(event), blocks, event.missedBlocks);
   }
 
   private recordObservedRoundRow(event: FollowerEvent, blocks: BlockRecord[]): void {
@@ -242,7 +311,7 @@ export class TerminalUi {
     if (!schedule?.current_shuffled_witnesses?.length) return;
 
     const rows = scheduledRoundRows(event.block.number, schedule, blocks, event.missedBlocks,
-      roundRowsOptions(event, blocks, this.displayedRoundScheduleMinBlock));
+      roundRowsOptions(dynamicGlobalProperties(event), blocks, this.displayedRoundScheduleMinBlock));
     const row = rows.find((candidate) => candidate.blockNumber === event.block.number);
     if (!row || row.settling || !row.producedWitness) return;
     if (!shouldPersistObservedRoundRow(row, event.missedBlocks)) return;
@@ -271,7 +340,7 @@ export class TerminalUi {
     this.retractingPredictedRows = suppressPredictions ? [] : this.retractingPredictedRows.filter((row) => row.blockNumber > displayHeadBlock);
     const key = `${scheduleSignature(schedule)}:${this.displayedRoundScheduleMinBlock ?? ""}`;
     const activeRows = scheduledRoundRows(displayHeadBlock, schedule, blocks, event.missedBlocks,
-      roundRowsOptions(event, blocks, this.displayedRoundScheduleMinBlock));
+      roundRowsOptions(dynamicGlobalProperties(event), blocks, this.displayedRoundScheduleMinBlock));
     const target = suppressPredictions ? 0 : countPredictedRows(activeRows, displayHeadBlock);
     const predictedRows = suppressPredictions ? [] : predictedRowsNearestFirst(activeRows, displayHeadBlock);
     if (key !== this.roundRevealKey) {
@@ -384,6 +453,7 @@ interface TxStatusQueueItem {
 }
 
 export class TransactionStatusMonitor {
+  private readonly abort = new AbortController();
   private readonly cache = new Map<string, TxStatusEntry>();
   private readonly queued = new Set<string>();
   private readonly checking = new Set<string>();
@@ -414,6 +484,7 @@ export class TransactionStatusMonitor {
 
   stop(): void {
     this.stopped = true;
+    this.abort.abort();
     this.queue = [];
     this.queued.clear();
     this.checking.clear();
@@ -570,6 +641,7 @@ export class TransactionStatusMonitor {
     try {
       const responses = await this.findTransactionBatch(batch);
       if (this.stopped) return;
+      if (this.warning?.startsWith("transaction status retryable error:")) this.warning = undefined;
       responses.forEach((response, index) => {
         const item = batch[index];
         if (item) this.commitAfterCheckingDwell(item.id, transactionStatusEntry(response, item.blockNumber));
@@ -583,7 +655,11 @@ export class TransactionStatusMonitor {
         this.queue = [];
         this.queued.clear();
       } else {
-        for (const item of batch) this.commitAfterCheckingDwell(item.id, { category: "unknown", glyph: "?", message });
+        for (const item of batch) {
+          this.checking.delete(item.id);
+          if (!this.queued.has(item.id)) { this.queue.push(item); this.queued.add(item.id); }
+        }
+        this.nextRequestAt = Math.max(this.nextRequestAt, Date.now() + 1000);
         this.warning = `transaction status retryable error: ${message}`;
       }
     } finally {
@@ -596,14 +672,14 @@ export class TransactionStatusMonitor {
   private async findTransactionBatch(batch: TxStatusQueueItem[]): Promise<TransactionStatusResponse[]> {
     if (this.behindVisibleWindow && batch.length > 1 && !this.batchUnavailable && this.client.findTransactions) {
       try {
-        return await this.client.findTransactions(batch);
+        return await this.client.findTransactions(batch, this.abort.signal);
       } catch (error) {
         if (isTransactionStatusApiUnavailable(error, error instanceof Error ? error.message : String(error))) throw error;
         this.batchUnavailable = true;
         this.warning = "transaction status batch unsupported; using single requests";
       }
     }
-    return Promise.all(batch.map((item) => this.client.findTransaction(item.id, item.expiration)));
+    return Promise.all(batch.map((item) => this.client.findTransaction(item.id, item.expiration, this.abort.signal)));
   }
 
   private commitAfterCheckingDwell(transactionId: string, entry: TxStatusEntry): void {
@@ -687,36 +763,115 @@ function transactionStatusEntry(response: TransactionStatusResponse, expectedBlo
 
 function isTransactionStatusApiUnavailable(error: unknown, message: string): boolean {
   if (error instanceof HiveRpcError && error.method !== "transaction_status_api.find_transaction") return false;
-  return /transaction_status_api|find_transaction|unknown api|method not found|does not exist|Assert Exception/i.test(message);
+  return /unknown api|method not found|could not find api|does not exist|no method with name/i.test(message);
 }
 
-function blockTableLines(event: FollowerEvent, blocks: BlockRecord[], scroll: number, rowCount: number, width: number): string[] {
-  const lines = [fit("BLOCK       (RANK) WITNESS           TX     OPS    VOPS", width)];
-  const feedAgeReference = chainTime(event);
+function helpLines(): string[] {
+  return [
+    "HELP / LEGENDS (Esc returns; arrows scroll)", "",
+    "v        Cycle blocks, witness round, transaction status",
+    "Up/Down  Select a row (j/k also work)",
+    "PgUp/Dn  Move one page; Home/g returns to live rows",
+    "Enter    Inspect a produced block; Esc closes details",
+    "/        Filter by witness; Enter applies; Esc clears",
+    "e        Event history: misses, node changes, RPC issues",
+    "p        Pause/resume following; r resets to head",
+    "q/Ctrl-C Quit; ? toggles this help", "",
+    "Round: > current round, * selected row",
+    "Round status: +/check = produced as scheduled; x = missed",
+    "? = unverified; - = predicted; spinner = next block",
+    "Witness color: green feed <=6h, yellow <24h, red >=24h",
+    "Inverted witness: running the majority version", "",
+    "Transaction colors: cyan checking, green irreversible,",
+    "white reversible, yellow pending/unknown, red expired/old",
+    "ASCII/NO_COLOR: * checking, I irreversible, R reversible,",
+    ". pending, ? unknown, M mempool, E expired, T old, ! mismatch",
+    "Stretched cells share one transaction's status.", "",
+    "STALE: no fresh head/data for 15 seconds.",
+    "RECONNECTING: the block RPC failed; retry is in progress.",
+    "Cached rates describe the last received block window.",
+    "Unavailable side panels retry every 30 seconds.",
+  ];
+}
 
-  for (const block of blocks.slice(scroll, scroll + rowCount)) {
+function blockDetailLines(block: BlockRecord | undefined, monitor?: TransactionStatusMonitor): string[] {
+  if (!block) return ["Block unavailable (Esc returns)"];
+  return [
+    `BLOCK ${block.number} (Esc returns; arrows scroll)`,
+    `Witness: ${block.witness} | UTC: ${block.timestamp.toISOString()}`,
+    `Transactions: ${block.transactionCount} | Operations: ${block.operationCount} | Virtual: ${block.virtualOperationCount}`,
+    "", "OPERATIONS",
+    ...[...block.operationTypes].sort((a, b) => b[1] - a[1]).map(([type, count]) => `${type}: ${count}`),
+    "", "TRANSACTIONS",
+    ...(block.transactions ?? []).flatMap((tx, index) => {
+      const status = monitor?.statusFor(tx.id);
+      return [`${index + 1}. ${tx.id}`,
+        `   ${tx.primaryOperationType ?? "unknown"} | ${status?.status ?? status?.category ?? "unchecked"} | expires ${tx.expiration ?? "-"}`];
+    }),
+    ...(!block.transactions?.length ? [block.transactionCount ? "Transaction IDs unavailable from node." : "No transactions."] : []),
+  ];
+}
+
+function wrapLine(line: string, width: number): string[] {
+  // Keep full transaction IDs and event messages available on narrow screens.
+  const text = stripAnsi(line).replace(/[\x00-\x1f\x7f]/g, " ");
+  return text.match(new RegExp(`.{1,${Math.max(1, width)}}`, "gu")) ?? [""];
+}
+
+interface TableSelection {
+  selectedBlock?: number;
+  witnessFilter: string;
+  blockNumbers: number[];
+  scroll: number;
+}
+
+function selectedTableStart(selection: TableSelection | undefined, scroll: number, rowCount: number): number {
+  if (!selection) return scroll;
+  const selectedIndex = selection.blockNumbers.indexOf(selection.selectedBlock ?? -1);
+  let start = Math.max(0, Math.min(scroll, selection.blockNumbers.length - rowCount));
+  if (selectedIndex >= 0 && selectedIndex < start) start = selectedIndex;
+  if (selectedIndex >= start + rowCount) start = selectedIndex - rowCount + 1;
+  selection.scroll = start;
+  return start;
+}
+
+function blockTableLines(event: FollowerEvent, blocks: BlockRecord[], scroll: number, rowCount: number, width: number, selection?: TableSelection, compact = false): string[] {
+  const lines = [fit(compact ? "  BLOCK       WITNESS              TX/OPS/VOPS" : "  BLOCK       (RANK) WITNESS           TX     OPS    VOPS", width)];
+  const feedAgeReference = chainTime(event);
+  blocks = blocks.filter((block) => block.witness.includes(selection?.witnessFilter ?? ""));
+  if (selection) selection.blockNumbers = blocks.map((block) => block.number);
+  const start = selectedTableStart(selection, scroll, rowCount);
+
+  for (const block of blocks.slice(start, start + rowCount)) {
+    const witnessWidth = compact ? Math.max(8, Math.min(22, width - 32)) : 22;
+    const counts = compact ? `${block.transactionCount}/${block.operationCount}/${block.virtualOperationCount}`
+      : `${String(block.transactionCount).padStart(5)} ${String(block.operationCount).padStart(7)} ${String(block.virtualOperationCount).padStart(7)}`;
     lines.push(
       fit(
-        `${String(block.number).padEnd(11)} ${formatRankedWitnessCell(block.witness, event.witnessRanks, event.witnessFeedUpdates, feedAgeReference, event.witnessVersions, event.majorityWitnessVersion, 22)} ${String(block.transactionCount).padStart(5)} ${String(block.operationCount).padStart(7)} ${String(block.virtualOperationCount).padStart(7)}`,
+        ` ${selection?.selectedBlock === block.number ? "*" : " "}${String(block.number).padEnd(11)} ${fit(formatRankedWitnessCell(block.witness, event.witnessRanks, event.witnessFeedUpdates, feedAgeReference, event.witnessVersions, event.majorityWitnessVersion, witnessWidth), witnessWidth)} ${counts}`,
         width,
       ),
     );
   }
+  if (!blocks.length) lines.push("No matching blocks yet.");
 
   return lines;
 }
 
-function txStatusTableLines(monitor: TransactionStatusMonitor | undefined, scroll: number, rowCount: number, width: number): string[] {
-  const lines = [fit("BLOCK       TX   STATUS MAP", width)];
+function txStatusTableLines(monitor: TransactionStatusMonitor | undefined, scroll: number, rowCount: number, width: number, selection?: TableSelection, ascii = false): string[] {
+  const lines = [fit("  BLOCK       TX   STATUS MAP", width)];
   if (!monitor) {
     lines.push(fit("transaction status monitor unavailable", width));
     return lines;
   }
 
-  for (const block of monitor.displayBlocks().slice(scroll, scroll + rowCount)) {
-    const prefix = `${String(block.number).padEnd(11)} ${String(block.transactionCount).padStart(3)}  `;
+  const blocks = monitor.displayBlocks().filter((block) => block.witness.includes(selection?.witnessFilter ?? ""));
+  if (selection) selection.blockNumbers = blocks.map((block) => block.number);
+  const start = selectedTableStart(selection, scroll, rowCount);
+  for (const block of blocks.slice(start, start + rowCount)) {
+    const prefix = ` ${selection?.selectedBlock === block.number ? "*" : " "}${String(block.number).padEnd(11)} ${String(block.transactionCount).padStart(3)}  `;
     const mapWidth = Math.max(0, width - stripAnsi(prefix).length);
-    lines.push(fit(prefix + formatTransactionStatusMap(block, monitor, mapWidth), width));
+    lines.push(fit(prefix + formatTransactionStatusMap(block, monitor, mapWidth, ascii), width));
   }
 
   const diagnostic = monitor.diagnostic();
@@ -724,25 +879,26 @@ function txStatusTableLines(monitor: TransactionStatusMonitor | undefined, scrol
   lines.push(fit(monitor.budgetLine(), width));
   lines.push(
     fit(
-      `${ansiStyle("█", "cyan", false)} checking  ${ansiStyle("█", "green", false)} irreversible  ${ansiStyle("█", "white", false)} reversible  ${ansiStyle("█", "orange", false)} pending/unknown  ${ansiStyle("█", "red", false)} expired/old`,
+      ascii ? "* checking I irreversible R reversible . pending ? unknown" : `${ansiStyle("█", "cyan", false)} checking  ${ansiStyle("█", "green", false)} irreversible  ${ansiStyle("█", "white", false)} reversible  ${ansiStyle("█", "orange", false)} pending/unknown  ${ansiStyle("█", "red", false)} expired/old`,
       width,
     ),
   );
+  if (ascii) lines.push(fit("M mempool E expired T old ! mismatch (? help)", width));
   return lines;
 }
 
-export function formatTransactionStatusMap(block: BlockRecord, monitor: TransactionStatusMonitor, width: number): string {
+export function formatTransactionStatusMap(block: BlockRecord, monitor: TransactionStatusMonitor, width: number, ascii = false): string {
   if (width <= 0) return "";
   if (block.transactions.length === 0) return "-";
   if (block.transactions.length > width) {
     return Array.from({ length: width }, (_, index) => {
       const start = Math.floor((index * block.transactions.length) / width);
       const end = Math.max(start + 1, Math.floor(((index + 1) * block.transactions.length) / width));
-      return formatTransactionStatusCell(mergeTransactionStatusEntries(block.transactions.slice(start, end).map((transaction) => monitor.statusFor(transaction.id))));
+      return formatTransactionStatusCell(mergeTransactionStatusEntries(block.transactions.slice(start, end).map((transaction) => monitor.statusFor(transaction.id))), 1, ascii);
     }).join("");
   }
   const cellWidths = justifiedCellWidths(block.transactions.length, width);
-  return block.transactions.map((transaction, index) => formatTransactionStatusCell(monitor.statusFor(transaction.id), cellWidths[index] ?? 1)).join("");
+  return block.transactions.map((transaction, index) => formatTransactionStatusCell(monitor.statusFor(transaction.id), cellWidths[index] ?? 1, ascii)).join("");
 }
 
 export function mergeTransactionStatusEntries(entries: TxStatusEntry[]): TxStatusEntry {
@@ -764,8 +920,8 @@ export function justifiedCellWidths(cellCount: number, width: number): number[] 
   return Array.from({ length: cellCount }, (_, index) => base + (index < remainder ? 1 : 0));
 }
 
-export function formatTransactionStatusCell(entry: TxStatusEntry, width = 1): string {
-  const cell = "█".repeat(width);
+export function formatTransactionStatusCell(entry: TxStatusEntry, width = 1, ascii = false): string {
+  const cell = (ascii ? entry.glyph : "█").repeat(width);
   if (entry.category === "checking") return ansiStyle(cell, "cyan", false);
   if (entry.category === "irreversible") return ansiStyle(cell, "green", false);
   if (entry.category === "mempool" || entry.category === "unknown" || entry.category === "pending") return ansiStyle(cell, "orange", false);
@@ -785,8 +941,10 @@ function roundTableLines(
   scroll: number,
   rowCount: number,
   width: number,
+  selection?: TableSelection,
+  compact = false,
 ): string[] {
-  const lines = [fit("  BLOCK       SCHEDULED WITNESS        STATUS   VERSION   FEED", width)];
+  const lines = [fit(compact ? "  BLOCK       SCHEDULED WITNESS        STATUS" : "  BLOCK       SCHEDULED WITNESS        STATUS   VERSION   FEED", width)];
   const props = dynamicGlobalProperties(event);
   const schedule = displayedSchedule ?? witnessSchedule(event);
   if (!props || !schedule?.current_shuffled_witnesses?.length || typeof props.head_block_number !== "number") {
@@ -801,10 +959,11 @@ function roundTableLines(
     : undefined;
   const roundStart = roundEnd === undefined ? undefined : roundEnd - witnessCount + 1;
   if (roundStart !== undefined && roundEnd !== undefined) {
-    lines.unshift(fit(`Current round ${roundStart}-${roundEnd} (${displayHeadBlock - roundStart + 1}/${witnessCount}) | > current`, width));
+    lines.unshift(fit(compact ? `Round ${displayHeadBlock - roundStart + 1}/${witnessCount}: ${roundStart}-${roundEnd} | > current`
+      : `Current round ${roundStart}-${roundEnd} (${displayHeadBlock - roundStart + 1}/${witnessCount}) | > current`, width));
   }
   const activeRoundRows = stabilizeObservedRoundRows(
-    scheduledRoundRows(displayHeadBlock, schedule, blocks, event.missedBlocks, roundRowsOptions(event, blocks, displayedScheduleMinBlock)),
+    scheduledRoundRows(displayHeadBlock, schedule, blocks, event.missedBlocks, roundRowsOptions(dynamicGlobalProperties(event), blocks, displayedScheduleMinBlock)),
     observedRoundRows,
   );
   const roundRows = scrollingRoundRows(activeRoundRows, observedRoundRows, displayHeadBlock);
@@ -812,11 +971,16 @@ function roundTableLines(
     revealPredictedRows(roundRows, displayHeadBlock, revealedFutureRows),
     retractingPredictedRows,
     displayHeadBlock,
-  );
-  const rowStart = scroll === 0 ? 0 : clampedScrollStart(visibleRoundRows, scroll, rowCount);
+  ).filter((row) => row.scheduledWitness.includes(selection?.witnessFilter ?? "") || Boolean(row.producedWitness?.includes(selection?.witnessFilter ?? "")));
+  if (selection) selection.blockNumbers = visibleRoundRows.map((row) => row.blockNumber);
+  const headIndex = visibleRoundRows.findIndex((row) => row.blockNumber <= displayHeadBlock);
+  const liveStart = selection?.selectedBlock === undefined && headIndex >= 0 ? Math.max(0, headIndex - Math.floor(rowCount / 2)) : scroll;
+  const rowStart = selectedTableStart(selection, clampedScrollStart(visibleRoundRows, liveStart, rowCount), rowCount);
   for (const row of visibleRoundRows.slice(rowStart, rowStart + rowCount)) {
     const roundMarker = roundStart !== undefined && roundEnd !== undefined && row.blockNumber >= roundStart && row.blockNumber <= roundEnd
-      ? ansiStyle("> ", "cyan", false) : "  ";
+      ? ansiStyle(">", "cyan", false) : " ";
+    const selectionMarker = selection?.selectedBlock === row.blockNumber ? "*" : " ";
+    const witnessWidth = compact ? Math.max(8, Math.min(22, width - 24)) : 22;
     const scheduled = row.settling
       ? "settling".padEnd(22)
       : formatRankedWitnessCell(
@@ -826,51 +990,26 @@ function roundTableLines(
           chainTime(event),
           event.witnessVersions,
           event.majorityWitnessVersion,
-          22,
+          witnessWidth,
     );
     const producedStatus = formatRoundProducedStatus(row, displayHeadBlock, spinnerFrame, event.missedBlocks);
     const producedStatusCell = formatProducedStatusCell(producedStatus, 8);
     lines.push(
       fit(
-        `${roundMarker}${String(row.blockNumber).padEnd(11)} ${scheduled} ${producedStatusCell} ${formatVersion(row.settling ? undefined : event.witnessVersions[row.scheduledWitness]).padEnd(9)} ${formatFeedAge(row.settling ? undefined : event.witnessFeedUpdates[row.scheduledWitness], chainTime(event)).padStart(6)}`,
+        `${roundMarker}${selectionMarker}${String(row.blockNumber).padEnd(11)} ${fit(scheduled, witnessWidth)} ${producedStatusCell}${compact ? "" : ` ${formatVersion(row.settling ? undefined : event.witnessVersions[row.scheduledWitness]).padEnd(9)} ${formatFeedAge(row.settling ? undefined : event.witnessFeedUpdates[row.scheduledWitness], chainTime(event)).padStart(6)}`}`,
         width,
       ),
     );
   }
 
   const warning = roundScheduleWarning(activeRoundRows, [], event.missedBlocks);
+  if (event.panelErrors?.schedule) lines.push(fit(`schedule unavailable/stale: ${event.panelErrors.schedule.message}`, width));
   if (warning) lines.push(fit(ansiStyle(warning, "orange", false), width));
   if (event.scheduleDiagnostics?.message) {
     lines.push(fit(ansiStyle(event.scheduleDiagnostics.message, "orange", false), width));
   }
 
   return lines;
-}
-
-export interface ScheduledRoundRow {
-  blockNumber: number;
-  scheduledWitness: string;
-  producedWitness?: string;
-  settling?: boolean;
-}
-
-export interface ScheduledRoundRowsOptions {
-  minBlockNumber?: number;
-  headSlot?: number;
-}
-
-function roundRowsOptions(event: FollowerEvent, blocks: BlockRecord[], minBlockNumber?: number): ScheduledRoundRowsOptions {
-  const props = dynamicGlobalProperties(event);
-  const headBlockNumber = latestProducedBlockNumber(blocks) ?? props?.head_block_number;
-  // DGPO's slot belongs to its head, which may be ahead of the followed blocks.
-  let headSlot = props?.head_block_number === headBlockNumber ? props?.current_aslot : undefined;
-  const head = blocks.find((block) => block.number === headBlockNumber);
-  const chainHeadTime = props && parseHiveUtcTime(props.time);
-  if (headSlot === undefined && props?.current_aslot !== undefined && head && chainHeadTime) {
-    const elapsedSlots = (chainHeadTime.getTime() - head.timestamp.getTime()) / 3000;
-    if (Number.isInteger(elapsedSlots) && elapsedSlots >= 0) headSlot = props.current_aslot - elapsedSlots;
-  }
-  return { minBlockNumber, headSlot };
 }
 
 export function stabilizeObservedRoundRows(rows: ScheduledRoundRow[], observedRows: Map<number, ScheduledRoundRow>): ScheduledRoundRow[] {
@@ -970,199 +1109,12 @@ function isPredictedRow(row: ScheduledRoundRow, headBlockNumber: number): boolea
   return row.blockNumber > headBlockNumber && !row.producedWitness && !row.settling;
 }
 
-export function schedulePredictionsExpired(schedule: WitnessSchedule, headBlockNumber: number): boolean {
-  return typeof schedule.next_shuffle_block_num === "number" &&
-    headBlockNumber >= schedule.next_shuffle_block_num + (schedule.future_shuffled_witnesses?.length ?? 0);
-}
-
-export function scheduledRoundRows(
-  headBlockNumber: number,
-  schedule: WitnessSchedule,
-  blocks: BlockRecord[],
-  missedBlocks: MissedBlock[] = [],
-  options: ScheduledRoundRowsOptions = {},
-): ScheduledRoundRow[] {
-  const witnesses = schedule.current_shuffled_witnesses ?? [];
-  if (witnesses.length === 0) return [];
-  const boundary = schedule.next_shuffle_block_num;
-  if (options.headSlot !== undefined && boundary !== undefined) {
-    const futureWitnesses = schedule.future_shuffled_witnesses ?? [];
-    const roundStart = boundary - witnesses.length + 1;
-    // Keep one round of lookahead; cross the boundary using the announced list.
-    const roundEnd = Math.min(boundary + futureWitnesses.length, headBlockNumber + witnesses.length);
-    if (headBlockNumber >= roundStart - 1 && headBlockNumber <= roundEnd) {
-      const missesAtHead = missedBlocks.filter((miss) => miss.detectedAtBlock <= headBlockNumber).length;
-      const producedByBlock = new Map(blocks.map((block) => [block.number, block]));
-      return Array.from({ length: roundEnd - roundStart + 1 }, (_, index) => {
-        const blockNumber = roundStart + index;
-        const slot = options.headSlot! + blockNumber - headBlockNumber - missesAtHead +
-          missedBlocks.filter((miss) => miss.detectedAtBlock < blockNumber).length;
-        const activeWitnesses = blockNumber <= boundary ? witnesses : futureWitnesses;
-        return {
-          blockNumber,
-          scheduledWitness: activeWitnesses[positiveModulo(slot, activeWitnesses.length)] ?? "unknown",
-          producedWitness: producedByBlock.get(blockNumber)?.witness,
-        };
-      });
-    }
-  }
-  const fit = bestScheduleFit(headBlockNumber, witnesses, blocks, missedBlocks, options.minBlockNumber);
-  if (!scheduleFitIsFresh(fit, headBlockNumber, witnesses.length)) {
-    return [
-      {
-        blockNumber: headBlockNumber,
-        scheduledWitness: "settling",
-        producedWitness: blocks.find((block) => block.number === headBlockNumber)?.witness,
-        settling: true,
-      },
-    ];
-  }
-
-  const offset = fit.offset;
-  const headSlot = slotPositionForProducedBlock(headBlockNumber, missedBlocks);
-  const fitRoundStart = headBlockNumber - positiveModulo(headSlot + offset, witnesses.length);
-  const roundStart = options.minBlockNumber === undefined ? fitRoundStart : Math.max(fitRoundStart, options.minBlockNumber);
-  const producedByBlock = new Map<number, BlockRecord>();
-  for (const block of blocks) {
-    if (block.number >= roundStart && block.number < roundStart + witnesses.length) {
-      producedByBlock.set(block.number, block);
-    }
-  }
-
-  return Array.from({ length: witnesses.length }, (_, index) => {
-    const blockNumber = roundStart + index;
-    const produced = producedByBlock.get(blockNumber);
-    const slotPosition = slotPositionForDisplayedBlock(blockNumber, missedBlocks);
-    return {
-      blockNumber,
-      scheduledWitness: witnesses[positiveModulo(slotPosition + offset, witnesses.length)] ?? "unknown",
-      producedWitness: produced?.witness,
-    };
-  });
-}
-
-function bestScheduleFit(
-  headBlockNumber: number,
-  witnesses: string[],
-  blocks: BlockRecord[],
-  missedBlocks: MissedBlock[],
-  minBlockNumber?: number,
-): { offset: number; matches: number; score: number; newestMatchBlock?: number } {
-  const recentProducedBlocks = blocks
-    .filter((block) => block.number <= headBlockNumber && (minBlockNumber === undefined || block.number >= minBlockNumber))
-    .sort((a, b) => a.number - b.number)
-    .slice(-witnesses.length * 2);
-  const observations = scheduleObservations(recentProducedBlocks, missedBlocks);
-  if (observations.length === 0) return { offset: 0, matches: 0, score: 0 };
-
-  let bestOffset = 0;
-  let bestScore = -1;
-  let bestMatches = 0;
-  let bestNewestMatchBlock: number | undefined;
-  for (let offset = 0; offset < witnesses.length; offset += 1) {
-    let score = 0;
-    let matches = 0;
-    let newestMatchBlock: number | undefined;
-    for (const observation of observations) {
-      if (witnesses[positiveModulo(observation.slotPosition + offset, witnesses.length)] === observation.witness) {
-        matches += 1;
-        if (newestMatchBlock === undefined || observation.blockNumber > newestMatchBlock) newestMatchBlock = observation.blockNumber;
-        score += witnesses.length - Math.min(witnesses.length - 1, Math.max(0, headBlockNumber - observation.blockNumber));
-      }
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestOffset = offset;
-      bestMatches = matches;
-      bestNewestMatchBlock = newestMatchBlock;
-    }
-  }
-
-  return { offset: bestOffset, matches: bestMatches, score: bestScore, newestMatchBlock: bestNewestMatchBlock };
-}
-
-function scheduleFitIsFresh(
-  fit: { matches: number; newestMatchBlock?: number },
-  headBlockNumber: number,
-  witnessCount: number,
-): boolean {
-  if (fit.matches <= 0 || fit.newestMatchBlock === undefined) return false;
-  return headBlockNumber - fit.newestMatchBlock < witnessCount;
-}
-
-function scheduleObservations(blocks: BlockRecord[], missedBlocks: MissedBlock[]): Array<{ blockNumber: number; slotPosition: number; witness: string }> {
-  const sortedBlocks = [...blocks].sort((a, b) => a.number - b.number);
-  const sortedMisses = [...missedBlocks].sort((a, b) => a.detectedAtBlock - b.detectedAtBlock);
-  const observations: Array<{ blockNumber: number; slotPosition: number; witness: string }> = [];
-  let missIndex = 0;
-  let missesBeforeOrAtBlock = 0;
-
-  for (const block of sortedBlocks) {
-    while (missIndex < sortedMisses.length && sortedMisses[missIndex].detectedAtBlock < block.number) {
-      missesBeforeOrAtBlock += 1;
-      missIndex += 1;
-    }
-
-    while (missIndex < sortedMisses.length && sortedMisses[missIndex].detectedAtBlock === block.number) {
-      observations.push({
-        blockNumber: block.number,
-        slotPosition: block.number + missesBeforeOrAtBlock,
-        witness: sortedMisses[missIndex].witness,
-      });
-      missesBeforeOrAtBlock += 1;
-      missIndex += 1;
-    }
-
-    observations.push({
-      blockNumber: block.number,
-      slotPosition: block.number + missesBeforeOrAtBlock,
-      witness: block.witness,
-    });
-  }
-
-  return observations;
-}
-
-function slotPositionForProducedBlock(blockNumber: number, missedBlocks: MissedBlock[]): number {
-  return blockNumber + missedBlocks.filter((miss) => miss.detectedAtBlock <= blockNumber).length;
-}
-
-function slotPositionForDisplayedBlock(blockNumber: number, missedBlocks: MissedBlock[]): number {
-  return blockNumber + missedBlocks.filter((miss) => miss.detectedAtBlock < blockNumber).length;
-}
-
-function scheduleSignature(schedule: WitnessSchedule): string {
-  return (schedule.current_shuffled_witnesses ?? []).join("\n");
-}
-
-export function rememberScheduleSignature(history: Map<string, number>, signature: string, blockNumber: number, maxSize = 32): void {
-  history.delete(signature);
-  history.set(signature, blockNumber);
-  while (history.size > maxSize) {
-    const oldest = history.keys().next().value;
-    if (oldest === undefined) return;
-    history.delete(oldest);
-  }
-}
-
-function latestProducedBlockNumber(blocks: BlockRecord[]): number | undefined {
-  let latest: number | undefined;
-  for (const block of blocks) {
-    if (latest === undefined || block.number > latest) latest = block.number;
-  }
-  return latest;
-}
-
 function trimObservedRows(rows: Map<number, ScheduledRoundRow>, maxSize: number): void {
   while (rows.size > maxSize) {
     const oldest = rows.keys().next().value;
     if (oldest === undefined) return;
     rows.delete(oldest);
   }
-}
-
-function positiveModulo(value: number, divisor: number): number {
-  return ((value % divisor) + divisor) % divisor;
 }
 
 export function headerSummary(event: FollowerEvent, view: string): string {
@@ -1277,9 +1229,9 @@ function dynamicPropertiesPanel(event: FollowerEvent, width: number): string[] {
     lines.push(...dhfPanel(props));
   }
   lines.push("");
-  lines.push(...rcPanel(event.rcInfo));
+  lines.push(...rcPanel(event.rcInfo, event.panelErrors?.rc?.message));
   lines.push("");
-  lines.push(...hardforkPanel(event.hardforkInfo));
+  lines.push(...hardforkPanel(event.hardforkInfo, event.panelErrors?.hardfork?.message));
   lines.push("");
   lines.push(...missedBlocksPanel(event.missedBlocks));
   return lines;
@@ -1294,10 +1246,11 @@ function dhfPanel(props: DynamicGlobalProperties): string[] {
   ];
 }
 
-function rcPanel(info: RcInfo | undefined): string[] {
+function rcPanel(info: RcInfo | undefined, error?: string): string[] {
   const lines = [color(" rc ", "white", "red") + " resource credits"];
+  if (error) lines.push(`${info ? "stale" : "unavailable"}: ${error}`);
   if (!info) {
-    lines.push("waiting for RC stats");
+    if (!error) lines.push("waiting for RC stats");
     return lines;
   }
 
@@ -1312,8 +1265,9 @@ function rcPanel(info: RcInfo | undefined): string[] {
   return lines;
 }
 
-function hardforkPanel(info: HardforkInfo | undefined): string[] {
+function hardforkPanel(info: HardforkInfo | undefined, error?: string): string[] {
   const lines = [color(" hardfork ", "white", "red") + " latest / next"];
+  if (error) lines.push(`${info ? "stale" : "unavailable"}: ${error}`);
   if (!info) {
     lines.push("Latest        -");
     lines.push("Next          -");

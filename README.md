@@ -6,13 +6,30 @@ It follows blocks through Hive JSON-RPC, aggregates recent block/transaction/ope
 
 ## Usage
 
+Requires **Node 24 or newer**. With nvm, run `nvm use` in this directory
+(`nvm install` if you do not yet have Node 24).
+
 ```bash
 npm start
+npm start -- --view round
+npm start -- --view txstatus --compact --ascii
 npm start -- --node https://api.hive.blog
 npm start -- --start 98765432
 npm start -- --window 120 --poll-ms 1000
 npm start -- --follow --node https://api.hive.blog --limit 42
+NO_COLOR=1 npm start
 ```
+
+The three views are blocks, the witness schedule (`round`), and transaction
+status (`txstatus`, the defrag view). `--view` chooses the starting view.
+The witness view previews the announced next round and marks the current round
+with `>`, its block range, and progress. Its live position keeps the latest
+produced block visible alongside predictions.
+
+`--compact` hides the sidebar and reduces the number of columns. Narrow terminals
+adapt automatically. `--ascii` replaces graphical status cells with distinct
+letters. `--no-color` or a nonempty `NO_COLOR` disables colors and also uses
+status letters, so the transaction map remains readable.
 
 By default, `hivetop` asks [PeakD Beacon](https://beacon.peakd.com/api/nodes)
 for available Hive API nodes. It follows `api.hive.blog` while its Beacon score
@@ -21,17 +38,58 @@ that advertises `get_rc_stats`. During runtime it uses the same Beacon-ordered
 node list for basic failover when RPC calls fail. Pass `--node` to pin a
 specific endpoint and disable Beacon failover.
 
+Each RPC request, including its response body, has a 10-second deadline;
+override it with `--rpc-timeout-ms MS`. The header shows the age of the latest
+received block and the most recent RPC response time. `STALE` means the node's
+head or the last data update is over 15 seconds old; `RECONNECTING` means the
+block RPC failed and is being retried. Cached rates describe the last received
+block window. While catching up, the block age refers to the followed block.
+
+RC stats, hardfork info, and witness ranks refresh independently of block
+tracking. Failed metadata requests retain last-known values, display an
+unavailable/stale notice, and retry after 30 seconds. The schedule is fetched
+with the block context; if unavailable, blocks still advance and the last-known
+schedule remains subject to its normal prediction expiry.
+
+The dashboard uses the terminal's alternate screen and restores the cursor and
+normal input mode when you quit, press Ctrl-C, or send SIGTERM. Redirected output
+requires `--follow`.
+
 Use `--follow` for investigation: it prints one JSON diagnostic record per
 block instead of opening the terminal UI. Pair it with `--limit NUM` to stop
 after a bounded number of produced block records.
+
+JSON diagnostics use the same accepted schedule, absolute slot, and shuffle
+boundary logic as the display. `future_block` and `future_scheduled` identify
+the first predicted block in the next round. `reported_schedule_sig` and
+`reported_next_shuffle_block_num` preserve what the node reported when it differs
+from the accepted schedule. `--limit` counts produced blocks and terminal gaps;
+an unavailable block is skipped after three retries in diagnostic mode.
 
 Keyboard controls:
 
 - `q` or `Ctrl-C`: quit
 - `p`: pause/resume rendering and block fetching
 - `r`: reset the follower to the current head block
-- `v`: switch between block and scheduled-round views
-- Arrow keys / PageUp / PageDown: scroll recent blocks
+- `v`: cycle blocks, witness round, and transaction status
+- Arrow keys / `j` / `k`: select a row (`*` marks the selection)
+- PageUp / PageDown: move by a page; Home / `g`: return to live rows
+- Enter: inspect the selected produced block, its transactions, and operation counts
+- `/`: filter by witness name; Enter applies the filter
+- `?`: help and legends
+- `e`: scrollable event history, newest first
+- Esc: close help/details/history, cancel input, or clear the witness filter
+
+Block details use data already received from the node. Future blocks become
+inspectable after production. The local event history retains the latest 100
+entries for this session: missed blocks, node changes, connection states, RPC
+errors, metadata failures, and schedule discrepancies. It is not written to disk.
+
+ASCII transaction legend: `*` checking, `I` irreversible, `R` reversible,
+`.` pending, `?` unknown, `M` mempool, `E` expired, `T` old, `!` block mismatch.
+Stretched cells share one transaction's status. In the witness view, `√` (ASCII
+`+`) means the expected witness produced, `x` means a miss backed by chain
+evidence, and `?` means the schedule is unverified.
 
 ## Development
 
@@ -41,3 +99,7 @@ The runtime is dependency-free and checked into `dist/` so it can run without in
 npm test
 npm run build
 ```
+
+GitHub Actions runs the tests on Node 24 and verifies that rebuilding does not
+change the checked-in `dist/` files. Run `npm ci` after cloning to install the
+development tools. Runtime dependencies are provided by Node itself.

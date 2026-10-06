@@ -1,5 +1,3 @@
-import http from "node:http";
-import https from "node:https";
 import type {
   AppliedOperation,
   DynamicGlobalProperties,
@@ -31,6 +29,7 @@ type RpcHeaders = Record<string, string | undefined>;
 
 export interface HiveRpcReadable {
   readonly endpoint: string;
+  readonly health?: { lastResponseAt?: number; latencyMs?: number };
   getDynamicGlobalProperties(signal?: AbortSignal): Promise<DynamicGlobalProperties>;
   getBlock(blockNumber: number, signal?: AbortSignal): Promise<HiveBlock | null>;
   getVirtualOperationsInBlock(blockNumber: number, signal?: AbortSignal): Promise<AppliedOperation[]>;
@@ -60,8 +59,9 @@ export class HiveRpcError extends Error {
 
 export class HiveRpcClient implements HiveRpcReadable {
   private id = 0;
+  readonly health: { lastResponseAt?: number; latencyMs?: number } = {};
 
-  constructor(public readonly endpoint: string, private readonly fetchImpl: FetchLike = defaultFetch) {}
+  constructor(public readonly endpoint: string, private readonly fetchImpl: FetchLike = defaultFetch, private readonly timeoutMs = 10_000) {}
 
   async getDynamicGlobalProperties(signal?: AbortSignal): Promise<DynamicGlobalProperties> {
     return this.call<DynamicGlobalProperties>("condenser_api.get_dynamic_global_properties", [], signal);
@@ -131,23 +131,8 @@ export class HiveRpcClient implements HiveRpcReadable {
       id: ++this.id,
     };
 
-    let response: RpcResponse;
-    try {
-      response = await this.fetchImpl(this.endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(request),
-        signal,
-      });
-    } catch (error) {
-      throw new HiveRpcError(`RPC request failed for ${method}`, method, error);
-    }
-
-    if (!response.ok) {
-      throw new HiveRpcError(`RPC request failed with HTTP ${response.status} for ${method}`, method);
-    }
-
-    const payload = (await response.json()) as { result?: T; error?: { message?: string } };
+    const { response, payload: body } = await this.request(request, method, signal);
+    const payload = body as { result?: T; error?: { message?: string } };
     if (payload.error) {
       throw new HiveRpcError(payload.error.message ?? `RPC error for ${method}`, method, payload.error);
     }
@@ -163,24 +148,9 @@ export class HiveRpcClient implements HiveRpcReadable {
       id: ++this.id,
     }));
 
-    let response: RpcResponse;
-    try {
-      response = await this.fetchImpl(this.endpoint, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(requests),
-        signal,
-      });
-    } catch (error) {
-      throw new HiveRpcError(`RPC batch request failed for ${calls[0]?.method ?? "unknown"}`, calls[0]?.method ?? "unknown", error);
-    }
-
     const method = calls[0]?.method ?? "unknown";
-    if (!response.ok) {
-      throw new HiveRpcError(`RPC batch request failed with HTTP ${response.status} for ${method}`, method);
-    }
-
-    const payload = (await response.json()) as Array<{ id?: number; result?: T; error?: { message?: string } }> | { error?: { message?: string } };
+    const { payload: body } = await this.request(requests, method, signal);
+    const payload = body as Array<{ id?: number; result?: T; error?: { message?: string } }> | { error?: { message?: string } };
     if (!Array.isArray(payload)) {
       throw new HiveRpcError(`RPC batch response was not an array for ${method}`, method, payload);
     }
@@ -193,11 +163,39 @@ export class HiveRpcClient implements HiveRpcReadable {
       return item.result as T;
     });
   }
+
+  private async request(body: unknown, method: string, signal?: AbortSignal): Promise<{ response: RpcResponse; payload: unknown }> {
+    signal?.throwIfAborted();
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), this.timeoutMs);
+    const startedAt = Date.now();
+    try {
+      const response = await this.fetchImpl(this.endpoint, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+        signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal,
+      });
+      if (!response.ok) throw new HiveRpcError(`RPC request failed with HTTP ${response.status} for ${method}`, method);
+      // Keep the deadline active while receiving and decoding the response body.
+      const payload = await response.json();
+      this.health.lastResponseAt = Date.now();
+      this.health.latencyMs = this.health.lastResponseAt - startedAt;
+      return { response, payload };
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      if (deadline.signal.aborted) throw new HiveRpcError(`RPC timeout after ${this.timeoutMs}ms for ${method}`, method, error);
+      if (error instanceof HiveRpcError) throw error;
+      throw new HiveRpcError(`RPC request failed for ${method}: ${error instanceof Error ? error.message : String(error)}`, method, error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 export class FailoverHiveRpcClient implements HiveRpcReadable {
   private currentIndex = 0;
   private readonly clients: HiveRpcReadable[];
+
+  get health(): HiveRpcReadable["health"] { return this.clients[this.currentIndex].health; }
 
   constructor(
     endpoints: string[],
@@ -287,67 +285,8 @@ export function withStableEndpoint<T>(client: HiveRpcReadable, read: (client: Hi
 }
 
 function defaultFetch(url: string, init: RpcRequestInit): Promise<RpcResponse> {
-  if (typeof globalThis.fetch === "function") {
-    return globalThis.fetch(url, init) as unknown as Promise<RpcResponse>;
-  }
-
-  return nodeFetch(url, init);
+  return globalThis.fetch(url, init) as unknown as Promise<RpcResponse>;
 }
-
-function nodeFetch(url: string, init: RpcRequestInit): Promise<RpcResponse> {
-  return new Promise((resolve, reject) => {
-    const endpoint = new URL(url);
-    const transport = endpoint.protocol === "http:" ? http : https;
-    let abortHandler: (() => void) | undefined;
-    const cleanup = () => {
-      if (abortHandler) init.signal?.removeEventListener("abort", abortHandler);
-    };
-    const request = transport.request(
-      endpoint,
-      {
-        method: init.method,
-        agent: endpoint.protocol === "http:" ? keepAliveHttpAgent : keepAliveHttpsAgent,
-        headers: {
-          ...init.headers,
-          "content-length": Buffer.byteLength(init.body),
-        },
-      },
-      (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer) => chunks.push(chunk));
-        response.on("end", () => {
-          cleanup();
-          const body = Buffer.concat(chunks).toString("utf8");
-          resolve({
-            ok: Boolean(response.statusCode && response.statusCode >= 200 && response.statusCode < 300),
-            status: response.statusCode ?? 0,
-            headers: normalizeNodeHeaders(response.headers),
-            async json() {
-              return JSON.parse(body);
-            },
-          });
-        });
-      },
-    );
-
-    request.on("error", (error) => {
-      cleanup();
-      reject(error);
-    });
-    if (init.signal) {
-      abortHandler = () => {
-        const error = new Error("aborted");
-        error.name = "AbortError";
-        request.destroy(error);
-      };
-      init.signal.addEventListener("abort", abortHandler, { once: true });
-    }
-    request.end(init.body);
-  });
-}
-
-const keepAliveHttpAgent = new http.Agent({ keepAlive: true });
-const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 
 function responseHeaders(response: RpcResponse): RpcHeaders {
   const headers = response.headers as RpcHeaders | { forEach?: (callback: (value: string, key: string) => void) => void } | undefined;
@@ -360,14 +299,6 @@ function responseHeaders(response: RpcResponse): RpcHeaders {
     return output;
   }
   for (const [key, value] of Object.entries(headers)) output[key.toLowerCase()] = value;
-  return output;
-}
-
-function normalizeNodeHeaders(headers: http.IncomingHttpHeaders): RpcHeaders {
-  const output: RpcHeaders = {};
-  for (const [key, value] of Object.entries(headers)) {
-    output[key.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
-  }
   return output;
 }
 

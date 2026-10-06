@@ -1,5 +1,3 @@
-import http from "node:http";
-import https from "node:https";
 export class HiveRpcError extends Error {
     method;
     cause;
@@ -13,10 +11,13 @@ export class HiveRpcError extends Error {
 export class HiveRpcClient {
     endpoint;
     fetchImpl;
+    timeoutMs;
     id = 0;
-    constructor(endpoint, fetchImpl = defaultFetch) {
+    health = {};
+    constructor(endpoint, fetchImpl = defaultFetch, timeoutMs = 10_000) {
         this.endpoint = endpoint;
         this.fetchImpl = fetchImpl;
+        this.timeoutMs = timeoutMs;
     }
     async getDynamicGlobalProperties(signal) {
         return this.call("condenser_api.get_dynamic_global_properties", [], signal);
@@ -67,22 +68,8 @@ export class HiveRpcClient {
             params,
             id: ++this.id,
         };
-        let response;
-        try {
-            response = await this.fetchImpl(this.endpoint, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify(request),
-                signal,
-            });
-        }
-        catch (error) {
-            throw new HiveRpcError(`RPC request failed for ${method}`, method, error);
-        }
-        if (!response.ok) {
-            throw new HiveRpcError(`RPC request failed with HTTP ${response.status} for ${method}`, method);
-        }
-        const payload = (await response.json());
+        const { response, payload: body } = await this.request(request, method, signal);
+        const payload = body;
         if (payload.error) {
             throw new HiveRpcError(payload.error.message ?? `RPC error for ${method}`, method, payload.error);
         }
@@ -95,23 +82,9 @@ export class HiveRpcClient {
             params: call.params,
             id: ++this.id,
         }));
-        let response;
-        try {
-            response = await this.fetchImpl(this.endpoint, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify(requests),
-                signal,
-            });
-        }
-        catch (error) {
-            throw new HiveRpcError(`RPC batch request failed for ${calls[0]?.method ?? "unknown"}`, calls[0]?.method ?? "unknown", error);
-        }
         const method = calls[0]?.method ?? "unknown";
-        if (!response.ok) {
-            throw new HiveRpcError(`RPC batch request failed with HTTP ${response.status} for ${method}`, method);
-        }
-        const payload = (await response.json());
+        const { payload: body } = await this.request(requests, method, signal);
+        const payload = body;
         if (!Array.isArray(payload)) {
             throw new HiveRpcError(`RPC batch response was not an array for ${method}`, method, payload);
         }
@@ -125,10 +98,42 @@ export class HiveRpcClient {
             return item.result;
         });
     }
+    async request(body, method, signal) {
+        signal?.throwIfAborted();
+        const deadline = new AbortController();
+        const timer = setTimeout(() => deadline.abort(), this.timeoutMs);
+        const startedAt = Date.now();
+        try {
+            const response = await this.fetchImpl(this.endpoint, {
+                method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+                signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal,
+            });
+            if (!response.ok)
+                throw new HiveRpcError(`RPC request failed with HTTP ${response.status} for ${method}`, method);
+            // Keep the deadline active while receiving and decoding the response body.
+            const payload = await response.json();
+            this.health.lastResponseAt = Date.now();
+            this.health.latencyMs = this.health.lastResponseAt - startedAt;
+            return { response, payload };
+        }
+        catch (error) {
+            if (signal?.aborted)
+                throw signal.reason;
+            if (deadline.signal.aborted)
+                throw new HiveRpcError(`RPC timeout after ${this.timeoutMs}ms for ${method}`, method, error);
+            if (error instanceof HiveRpcError)
+                throw error;
+            throw new HiveRpcError(`RPC request failed for ${method}: ${error instanceof Error ? error.message : String(error)}`, method, error);
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
 }
 export class FailoverHiveRpcClient {
     currentIndex = 0;
     clients;
+    get health() { return this.clients[this.currentIndex].health; }
     constructor(endpoints, clientFactory = (endpoint) => new HiveRpcClient(endpoint)) {
         const uniqueEndpoints = Array.from(new Set(endpoints.filter((endpoint) => endpoint.length > 0)));
         if (uniqueEndpoints.length === 0)
@@ -204,60 +209,8 @@ export function withStableEndpoint(client, read, signal) {
     return stableClient.withStableEndpoint ? stableClient.withStableEndpoint(read, signal) : read(client);
 }
 function defaultFetch(url, init) {
-    if (typeof globalThis.fetch === "function") {
-        return globalThis.fetch(url, init);
-    }
-    return nodeFetch(url, init);
+    return globalThis.fetch(url, init);
 }
-function nodeFetch(url, init) {
-    return new Promise((resolve, reject) => {
-        const endpoint = new URL(url);
-        const transport = endpoint.protocol === "http:" ? http : https;
-        let abortHandler;
-        const cleanup = () => {
-            if (abortHandler)
-                init.signal?.removeEventListener("abort", abortHandler);
-        };
-        const request = transport.request(endpoint, {
-            method: init.method,
-            agent: endpoint.protocol === "http:" ? keepAliveHttpAgent : keepAliveHttpsAgent,
-            headers: {
-                ...init.headers,
-                "content-length": Buffer.byteLength(init.body),
-            },
-        }, (response) => {
-            const chunks = [];
-            response.on("data", (chunk) => chunks.push(chunk));
-            response.on("end", () => {
-                cleanup();
-                const body = Buffer.concat(chunks).toString("utf8");
-                resolve({
-                    ok: Boolean(response.statusCode && response.statusCode >= 200 && response.statusCode < 300),
-                    status: response.statusCode ?? 0,
-                    headers: normalizeNodeHeaders(response.headers),
-                    async json() {
-                        return JSON.parse(body);
-                    },
-                });
-            });
-        });
-        request.on("error", (error) => {
-            cleanup();
-            reject(error);
-        });
-        if (init.signal) {
-            abortHandler = () => {
-                const error = new Error("aborted");
-                error.name = "AbortError";
-                request.destroy(error);
-            };
-            init.signal.addEventListener("abort", abortHandler, { once: true });
-        }
-        request.end(init.body);
-    });
-}
-const keepAliveHttpAgent = new http.Agent({ keepAlive: true });
-const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 function responseHeaders(response) {
     const headers = response.headers;
     const output = {};
@@ -271,13 +224,6 @@ function responseHeaders(response) {
     }
     for (const [key, value] of Object.entries(headers))
         output[key.toLowerCase()] = value;
-    return output;
-}
-function normalizeNodeHeaders(headers) {
-    const output = {};
-    for (const [key, value] of Object.entries(headers)) {
-        output[key.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
-    }
     return output;
 }
 function annotateWitnessSchedule(schedule, endpoint, headers) {

@@ -1181,3 +1181,103 @@ async function waitFor(predicate, timeoutMs = 100) {
     await sleep(0);
   }
 }
+
+test("terminal controls filter witnesses, inspect blocks, and preserve event history", () => {
+  const originalWrite = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk) => { output = stripAnsi(String(chunk)); return true; };
+  let node = "https://one.test";
+  let quit = false;
+  const ui = new TerminalUi({ node: () => node, windowSeconds: 120, noColor: true, onQuit() { quit = true; }, onPauseToggle() {}, onReset() {} });
+  const now = new Date();
+  const blocks = [
+    { ...blockRecord(11), timestamp: now, witness: "bob" },
+    { ...blockRecord(10, [{ id: "transaction-abc", primaryOperationType: "vote" }]), timestamp: now, operationCount: 2, operationTypes: new Map([["vote", 2]]) },
+  ];
+  const snapshot = { blocks, blockRate: 0.3, transactionRate: 1, operationRate: 2, virtualOperationRate: 0, operationTypes: [], witnesses: [] };
+  const event = { type: "block", block: blocks[0], headBlock: 11, lag: 0, dynamicGlobalProperties: { head_block_number: 11, time: now.toISOString() }, witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] };
+  try {
+    ui.render(event, snapshot);
+    assert.match(output, /LIVE \| block/);
+    ui.onKey("/"); ui.onKey("alice"); ui.onKey("\r");
+    assert.match(output, /Witness filter: alice/);
+    assert.deepEqual(ui.tableBlockNumbers, [10]);
+    ui.onKey("\u001b[B"); ui.onKey("\r");
+    assert.match(output, /BLOCK 10 \(Esc returns/);
+    assert.match(output, /vote: 2/);
+    assert.match(output, /transaction-abc/);
+    ui.onKey("\u001b"); ui.onKey("\u001b");
+    assert.deepEqual(ui.tableBlockNumbers, [11, 10]);
+    ui.onKey("?"); assert.match(output, /HELP \/ LEGENDS/); ui.onKey("\u001b");
+    ui.lastDataReceivedAt = Date.now() - 16000;
+    ui.draw();
+    assert.match(output, /STALE \| block/);
+    assert.match(output, /cached blk\/s/);
+    ui.render({ ...event, type: "retry", message: "offline", retryInMs: 1000 }, snapshot);
+    assert.match(output, /RECONNECTING/);
+    node = "https://two.test";
+    ui.render({ ...event, missedBlocks: [{ detectedAtBlock: 11, witness: "carol", detectedAt: now.toISOString() }] }, snapshot);
+    assert.match(output, /LIVE \| block/);
+    ui.onKey("e");
+    assert.match(output, /Missed block 11: carol/);
+    assert.match(output, /Node switched:/);
+    assert.match(output, /RPC interrupted: offline/);
+    ui.onKey("q"); assert.equal(quit, true);
+  } finally { ui.stop(); process.stdout.write = originalWrite; }
+});
+
+test("ASCII/NO_COLOR views fit small terminals and keep status distinctions", () => {
+  const originalWrite = process.stdout.write;
+  const oldColumns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  const oldRows = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+  let output = "";
+  process.stdout.write = (chunk) => { output = String(chunk); return true; };
+  try {
+    for (const [columns, rows] of [[48, 18], [80, 24], [160, 50]]) {
+      Object.defineProperty(process.stdout, "columns", { configurable: true, value: columns });
+      Object.defineProperty(process.stdout, "rows", { configurable: true, value: rows });
+      for (const view of ["blocks", "round", "txstatus"]) {
+        const ui = new TerminalUi({ node: "test", windowSeconds: 120, view, ascii: true, noColor: true, onQuit() {}, onPauseToggle() {}, onReset() {}, transactionStatusClient: { async findTransaction() { return { status: "within_irreversible_block" }; } } });
+        const block = { ...blockRecord(104, [{ id: "tx1" }, { id: "tx2" }]), timestamp: new Date(), witness: "bob" };
+        try {
+          ui.render({ type: "block", block, headBlock: 104, lag: 0, dynamicGlobalProperties: { head_block_number: 104, current_aslot: 103, time: block.timestamp.toISOString() }, witnessSchedule: { current_shuffled_witnesses: ["alice", "bob", "carol"], future_shuffled_witnesses: ["dan", "erin", "frank"], next_shuffle_block_num: 105 }, witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] },
+            { blocks: [block], blockRate: 0.3, transactionRate: 1, operationRate: 2, virtualOperationRate: 0, operationTypes: [], witnesses: [] });
+          const text = stripAnsi(output);
+          assert.equal(/[^\x00-\x7f]/.test(text), false);
+          assert.equal(/\x1b\[[0-9;]*m/.test(output), false);
+          assert.ok(text.split("\n").length <= rows);
+          assert.ok(text.split("\n").every((line) => line.length <= columns));
+          assert.match(text, /q quit/);
+          if (view === "round") assert.match(text, /104\s/);
+        } finally { ui.stop(); }
+      }
+    }
+    assert.equal(stripAnsi(formatTransactionStatusCell({ category: "irreversible", glyph: "I" }, 3, true)), "III");
+    assert.equal(stripAnsi(formatTransactionStatusCell({ category: "reversible", glyph: "R" }, 2, true)), "RR");
+  } finally {
+    process.stdout.write = originalWrite;
+    if (oldColumns) Object.defineProperty(process.stdout, "columns", oldColumns); else delete process.stdout.columns;
+    if (oldRows) Object.defineProperty(process.stdout, "rows", oldRows); else delete process.stdout.rows;
+  }
+});
+
+test("transaction RPC timeouts retry and stopping the monitor cancels requests", async () => {
+  let calls = 0;
+  let signal;
+  const monitor = new TransactionStatusMonitor({
+    async findTransaction(id, expiration, requestSignal) {
+      signal = requestSignal;
+      if (++calls === 1) throw new Error("RPC timeout for transaction_status_api.find_transaction");
+      return { status: "within_irreversible_block", block_num: 10 };
+    },
+  }, 1, 500, 1, 300, 0);
+  try {
+    monitor.sync({ blocks: [blockRecord(10, [{ id: "tx" }])] }, () => {});
+    await waitFor(() => monitor.diagnostic()?.includes("retryable error"));
+    assert.equal(monitor.statusFor("tx").category, "pending");
+    await waitFor(() => monitor.statusFor("tx").category === "irreversible", 2000);
+    assert.equal(calls, 2);
+    assert.equal(monitor.diagnostic(), undefined);
+  } finally { monitor.stop(); }
+  assert.equal(signal.aborted, true);
+});

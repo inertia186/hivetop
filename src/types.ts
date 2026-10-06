@@ -175,6 +175,7 @@ export interface BlockRecord {
 }
 
 export interface FollowerMetadata {
+  panelErrors?: Partial<Record<"rc" | "hardfork" | "witnesses" | "schedule", { message: string; at: number }>>;
   hardforkInfo?: HardforkInfo;
   rcInfo?: RcInfo;
   witnessRanks: WitnessRanks;

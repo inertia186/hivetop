@@ -443,3 +443,42 @@ function rcStatsResponse() {
     },
   };
 }
+
+test("slow or unavailable side panels do not stop blocks, retain cached data, and back off", { timeout: 1500 }, async () => {
+  let head = 10;
+  let rcCalls = 0;
+  let rejectRc;
+  const client = {
+    endpoint: "https://example.test",
+    async getDynamicGlobalProperties() { return { head_block_number: head++, time: "2026-06-16T20:00:00" }; },
+    async getBlock() { return { timestamp: "2026-06-16T20:00:00", witness: "alice", transactions: [] }; },
+    async getVirtualOperationsInBlock() { return []; },
+    async getWitnessSchedule() { throw new Error("schedule unavailable"); },
+    async getHardforkVersion() { throw new Error("hardfork unavailable"); },
+    async getNextScheduledHardfork() { return {}; },
+    async getWitnessesByVote() { throw new Error("witnesses unavailable"); },
+    async getRcStats() {
+      if (++rcCalls === 1) return rcStatsResponse();
+      return new Promise((resolve, reject) => { rejectRc = reject; });
+    },
+  };
+  const abort = new AbortController();
+  const follower = new BlockFollower(client, { pollMs: 1, retryMs: 1, rcStatsRefreshMs: 0 });
+  const iterator = follower.follow(abort.signal);
+  try {
+    const first = (await iterator.next()).value;
+    assert.equal(first.type, "block");
+    assert.equal(first.rcInfo.voteCost, 96_105_296);
+    assert.match(first.panelErrors.schedule.message, /unavailable/);
+    await follower.metadataRefresh;
+    const second = (await iterator.next()).value;
+    assert.equal(second.block.number, 11, "a pending RC request must not hold up the block");
+    rejectRc(new Error("RC unavailable"));
+    await follower.metadataRefresh;
+    const third = (await iterator.next()).value;
+    assert.equal(third.block.number, 12);
+    assert.match(third.panelErrors.rc.message, /RC unavailable/);
+    assert.equal(third.rcInfo.voteCost, first.rcInfo.voteCost, "retain last-known data while marking it stale");
+    assert.equal(rcCalls, 2, "unavailable panels should back off instead of retrying per block");
+  } finally { abort.abort(); await iterator.return(); }
+});

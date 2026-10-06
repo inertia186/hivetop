@@ -3,8 +3,9 @@ import { pathToFileURL } from "node:url";
 import { BlockFollower, missedBlocksFromVirtualOperations, sleep, toBlockRecord } from "./follower.js";
 import { MetricsStore } from "./metrics.js";
 import { FailoverHiveRpcClient, HiveRpcClient, withStableEndpoint } from "./rpc.js";
-import { formatProducedStatus, scheduledRoundRows } from "./tui.js";
-import { TerminalUi } from "./tui.js";
+import { formatRoundProducedStatus } from "./tui.js";
+import { WitnessScheduleTracker, scheduledRoundRows, roundRowsOptions } from "./schedule.js";
+import { TerminalUi, type TerminalView } from "./tui.js";
 import { selectHiveNode } from "./beacon.js";
 import type { BlockRecord, MissedBlock, WitnessSchedule } from "./types.js";
 
@@ -18,6 +19,11 @@ interface CliOptions {
   limit?: number;
   maxGapRetries?: number;
   gapRetryMs?: number;
+  view?: TerminalView;
+  ascii?: boolean;
+  compact?: boolean;
+  noColor?: boolean;
+  rpcTimeoutMs?: number;
 }
 
 const DEFAULT_NODE = "https://api.hive.blog";
@@ -31,13 +37,17 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
 }
 
 async function main(): Promise<void> {
+  if (Number(process.versions.node.split(".")[0]) < 24) throw new Error("hivetop requires Node 24 or newer. Run `nvm use` in this project.");
   const options = parseArgs(process.argv.slice(2));
+  if (!options.follow && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new Error("The dashboard needs an interactive terminal. Use --follow for JSON output.");
   const abort = new AbortController();
   process.on("SIGINT", () => abort.abort());
+  process.on("SIGTERM", () => abort.abort());
   const selection = options.nodeExplicit
     ? { endpoint: options.node, endpoints: [options.node] }
     : await selectHiveNode({ fallbackEndpoint: options.node, signal: abort.signal });
-  const client = options.nodeExplicit ? new HiveRpcClient(selection.endpoint) : new FailoverHiveRpcClient(selection.endpoints);
+  const rpcClient = (endpoint: string) => new HiveRpcClient(endpoint, undefined, options.rpcTimeoutMs);
+  const client = options.nodeExplicit ? rpcClient(selection.endpoint) : new FailoverHiveRpcClient(selection.endpoints, rpcClient);
   if (options.follow) {
     await runFollowLog(client, options, abort.signal);
     return;
@@ -53,6 +63,10 @@ async function main(): Promise<void> {
     node: () => client.endpoint,
     windowSeconds: options.window,
     transactionStatusClient: client,
+    view: options.view,
+    ascii: options.ascii,
+    compact: options.compact,
+    noColor: options.noColor,
     onQuit: () => abort.abort(),
     onPauseToggle: (paused) => (paused ? follower.pause() : follower.resume()),
     onReset: () => follower.resetToHead(),
@@ -74,7 +88,7 @@ export async function runFollowLog(client: HiveRpcClient | FailoverHiveRpcClient
   let missedBlocks: MissedBlock[] = [];
   let nextBlock = options.start;
   let lastScheduleSignature = "";
-  let scheduleMinBlock: number | undefined;
+  const scheduleTracker = new WitnessScheduleTracker();
   let emittedRecords = 0;
   let gapRetries = 0;
   const maxGapRetries = options.maxGapRetries ?? DEFAULT_FOLLOW_GAP_RETRIES;
@@ -139,15 +153,15 @@ export async function runFollowLog(client: HiveRpcClient | FailoverHiveRpcClient
     const newMisses = missedBlocksFromVirtualOperations(nextBlock, block.timestamp, virtualOperations);
     if (newMisses.length > 0) missedBlocks = [...newMisses, ...missedBlocks].slice(0, 24);
 
-    const scheduleSignature = witnessScheduleSignature(schedule);
+    scheduleTracker.update(props, schedule, blocks, missedBlocks);
+    const displayedSchedule = scheduleTracker.schedule ?? schedule;
+    const scheduleSignature = witnessScheduleSignature(displayedSchedule);
     const scheduleChanged = scheduleSignature !== lastScheduleSignature;
-    if (scheduleChanged) scheduleMinBlock = nextBlock;
     lastScheduleSignature = scheduleSignature;
-    const rows = scheduledRoundRows(nextBlock, schedule, blocks, missedBlocks, { minBlockNumber: scheduleMinBlock });
+    const rows = scheduledRoundRows(nextBlock, displayedSchedule, blocks, missedBlocks, roundRowsOptions(props, blocks, scheduleTracker.minBlockNumber));
     const row = rows.find((candidate) => candidate.blockNumber === nextBlock);
-    const futureSchedule = futureWitnessSchedule(schedule);
-    const futureRows = futureSchedule ? scheduledRoundRows(nextBlock, futureSchedule, blocks, missedBlocks) : [];
-    const futureRow = futureRows.find((candidate) => candidate.blockNumber === nextBlock);
+    const futureBoundary = Math.max(nextBlock, displayedSchedule.next_shuffle_block_num ?? nextBlock);
+    const futureRow = rows.find((candidate) => candidate.blockNumber > futureBoundary);
 
     console.log(
       JSON.stringify({
@@ -160,17 +174,21 @@ export async function runFollowLog(client: HiveRpcClient | FailoverHiveRpcClient
         dgpo_time: props.time,
         produced: block.witness,
         scheduled: row?.settling ? undefined : row?.scheduledWitness,
-        status: row ? formatProducedStatus(row) : "?",
+        status: row ? formatRoundProducedStatus(row, nextBlock, 0, missedBlocks) : "?",
+        current_aslot: props.current_aslot,
+        future_block: futureRow?.blockNumber,
         future_scheduled: futureRow?.settling ? undefined : futureRow?.scheduledWitness,
-        future_status: futureRow ? formatProducedStatus(futureRow) : undefined,
+        future_status: futureRow ? "-" : undefined,
         settling: Boolean(row?.settling),
         schedule_changed: scheduleChanged,
-        next_shuffle_block_num: schedule.next_shuffle_block_num,
-        schedule_index: schedule.current_shuffled_witnesses?.indexOf(block.witness) ?? -1,
-        future_schedule_index: schedule.future_shuffled_witnesses?.indexOf(block.witness) ?? -1,
-        schedule_sig: shortScheduleSignature(schedule),
-        future_schedule_sig: shortWitnessListSignature(schedule.future_shuffled_witnesses),
-        future_changes: schedule.future_changes,
+        next_shuffle_block_num: displayedSchedule.next_shuffle_block_num,
+        schedule_index: displayedSchedule.current_shuffled_witnesses?.indexOf(block.witness) ?? -1,
+        future_schedule_index: displayedSchedule.future_shuffled_witnesses?.indexOf(block.witness) ?? -1,
+        schedule_sig: shortScheduleSignature(displayedSchedule),
+        future_schedule_sig: shortWitnessListSignature(displayedSchedule.future_shuffled_witnesses),
+        reported_schedule_sig: shortScheduleSignature(schedule),
+        reported_next_shuffle_block_num: schedule.next_shuffle_block_num,
+        future_changes: displayedSchedule.future_changes,
         missed: newMisses.map((miss) => miss.witness),
       }),
     );
@@ -195,15 +213,7 @@ function shortWitnessListSignature(witnesses: string[] | undefined): string {
   return `${witnesses[0]}..${witnesses[witnesses.length - 1]}`;
 }
 
-function futureWitnessSchedule(schedule: WitnessSchedule): WitnessSchedule | undefined {
-  if (!schedule.future_shuffled_witnesses?.length) return undefined;
-  return {
-    ...schedule,
-    current_shuffled_witnesses: schedule.future_shuffled_witnesses,
-  };
-}
-
-function parseArgs(args: string[]): CliOptions {
+export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     node: DEFAULT_NODE,
     nodeExplicit: false,
@@ -233,6 +243,19 @@ function parseArgs(args: string[]): CliOptions {
     } else if (arg === "--limit" && value) {
       options.limit = positiveInteger(value, "--limit");
       index += 1;
+    } else if (arg === "--view" && value) {
+      if (value !== "blocks" && value !== "round" && value !== "txstatus") throw new Error("--view must be blocks, round, or txstatus");
+      options.view = value;
+      index += 1;
+    } else if (arg === "--rpc-timeout-ms" && value) {
+      options.rpcTimeoutMs = positiveInteger(value, "--rpc-timeout-ms");
+      index += 1;
+    } else if (arg === "--ascii") {
+      options.ascii = true;
+    } else if (arg === "--compact") {
+      options.compact = true;
+    } else if (arg === "--no-color") {
+      options.noColor = true;
     } else if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -255,6 +278,8 @@ function printHelp(): void {
 
 Usage:
   hivetop [--node URL] [--start BLOCK] [--window SECONDS] [--poll-ms MS]
+          [--view blocks|round|txstatus] [--compact] [--ascii] [--no-color]
+          [--rpc-timeout-ms MS]
   hivetop --follow [--node URL] [--start BLOCK] [--poll-ms MS] [--limit NUM]
 
 By default, hivetop asks PeakD Beacon for healthy Hive API nodes, keeps
@@ -264,8 +289,9 @@ node list when RPC calls fail. Use --node to pin a specific endpoint.
 
 Use --follow to print one JSON diagnostic record per block instead of opening
 the terminal UI. It fetches the witness schedule every block and includes the
-produced witness, inferred scheduled witness, status marker, next shuffle block,
-schedule signature, endpoint, and producer_missed virtual ops.
+produced witness, scheduled witness using the same slot/boundary logic as the UI,
+status, next shuffle block, schedule signature, endpoint, and producer_missed ops.
+future_block/future_scheduled describe the first predicted block of the next round.
 Use --limit with --follow to stop after NUM emitted block/gap records. A block
 that remains unavailable after bounded retries is emitted as a terminal gap and
 the follower advances.
@@ -274,6 +300,18 @@ Controls:
   q, Ctrl-C  Quit
   p          Pause/resume
   r          Reset to current head
-  arrows     Scroll recent blocks
+  v          Cycle blocks, witness round, transaction status (defrag)
+  arrows/j/k Select rows; PageUp/PageDown moves a page; Home/g follows live
+  Enter      Inspect the selected produced block
+  /          Filter by witness name; Enter applies; Esc clears/closes
+  ?          Help and legends
+  e          Recent event history
+
+RPC requests time out after 10000ms by default. Optional side-panel failures
+are marked unavailable/stale and retried every 30 seconds.
+--compact hides the sidebar and uses fewer columns; narrow terminals adapt
+automatically. --ascii uses status letters; --no-color or a nonempty NO_COLOR
+environment variable disables colors and also uses distinct status letters.
+Requires Node 24+. Run nvm use if you use nvm.
 `);
 }

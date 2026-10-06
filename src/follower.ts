@@ -51,6 +51,8 @@ export class BlockFollower {
   private rcInfo: RcInfo | undefined;
   private rcInfoFetchedAt = 0;
   private missedBlocks: MissedBlock[] = [];
+  private readonly panelErrors: NonNullable<FollowerMetadata["panelErrors"]> = {};
+  private metadataRefresh: Promise<void> | undefined;
 
   constructor(
     private readonly client: HiveRpcReadable,
@@ -84,10 +86,9 @@ export class BlockFollower {
           async (client) => {
             const props = await client.getDynamicGlobalProperties(signal);
             if (signal?.aborted) throw abortError();
-            await this.refreshHardforkInfo(client, signal);
-            await this.refreshRcInfo(client, signal);
-            const witnessSchedule = await this.refreshWitnessSchedule(client, props, signal);
-            await this.refreshWitnessRanks(client, signal);
+            this.refreshSidePanels(client, signal);
+            await this.refreshPanel("schedule", () => this.refreshWitnessSchedule(client, props, signal), signal);
+            const witnessSchedule = this.witnessSchedule;
             const effectiveNextBlock = this.resetRequested ? props.head_block_number : (nextBlock ?? props.head_block_number);
             if (effectiveNextBlock > props.head_block_number) {
               return { props, witnessSchedule, nextBlock: effectiveNextBlock };
@@ -167,6 +168,7 @@ export class BlockFollower {
 
   private metadata(): FollowerMetadata {
     return {
+      panelErrors: { ...this.panelErrors },
       hardforkInfo: this.hardforkInfo,
       rcInfo: this.rcInfo,
       witnessRanks: this.witnessRanks,
@@ -176,6 +178,27 @@ export class BlockFollower {
       scheduleDiagnostics: this.witnessScheduleDiagnostics,
       missedBlocks: this.missedBlocks,
     };
+  }
+
+  private refreshSidePanels(client: HiveRpcReadable, signal?: AbortSignal): void {
+    if (this.metadataRefresh) return;
+    this.metadataRefresh = Promise.all([
+      this.refreshPanel("hardfork", () => this.refreshHardforkInfo(client, signal), signal),
+      this.refreshPanel("rc", () => this.refreshRcInfo(client, signal), signal),
+      this.refreshPanel("witnesses", () => this.refreshWitnessRanks(client, signal), signal),
+    ]).then(() => {}).finally(() => { this.metadataRefresh = undefined; });
+  }
+
+  private async refreshPanel(panel: keyof NonNullable<FollowerMetadata["panelErrors"]>, refresh: () => Promise<unknown>, signal?: AbortSignal): Promise<void> {
+    const error = this.panelErrors[panel];
+    if (error && Date.now() - error.at < 30_000) return;
+    try {
+      await refresh();
+      delete this.panelErrors[panel];
+    } catch (error) {
+      if (signal?.aborted) return;
+      this.panelErrors[panel] = { message: error instanceof Error ? error.message : String(error), at: Date.now() };
+    }
   }
 
   private async refreshHardforkInfo(client: HiveRpcReadable, signal?: AbortSignal): Promise<HardforkInfo | undefined> {

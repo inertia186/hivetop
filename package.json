@@ -14,10 +14,10 @@
     "build": "tsc -p tsconfig.json && node ./scripts/make-cli-executable.mjs"
   },
   "engines": {
-    "node": ">=16.20.0"
+    "node": ">=24"
   },
   "devDependencies": {
-    "@types/node": "^16.18.0",
+    "@types/node": "^24.19.1",
     "typescript": "^5.8.0"
   }
 }

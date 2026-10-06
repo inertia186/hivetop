@@ -267,3 +267,37 @@ function response(payload, ok = true, status = 200, headers = {}) {
     },
   };
 }
+
+test("RPC deadlines cover the response body and let failover recover", async () => {
+  let timedOutSignal;
+  const client = new FailoverHiveRpcClient(["https://slow.test", "https://healthy.test"], (endpoint) =>
+    new HiveRpcClient(endpoint, async (_url, init) => {
+      if (endpoint === "https://healthy.test") return response({ result: { head_block_number: 42 } });
+      timedOutSignal = init.signal;
+      return { ok: true, status: 200, json: () => new Promise((resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+      }) };
+    }, 15));
+  assert.equal((await client.getDynamicGlobalProperties()).head_block_number, 42);
+  assert.equal(timedOutSignal.aborted, true);
+  assert.equal(client.endpoint, "https://healthy.test");
+  assert.ok(client.health.lastResponseAt <= Date.now());
+  assert.ok(client.health.latencyMs >= 0);
+});
+
+test("RPC batch requests time out and caller cancellation does not fail over", async () => {
+  const batch = new HiveRpcClient("https://slow.test", (_url, init) => new Promise((resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+  }), 15);
+  await assert.rejects(batch.findTransactions([{ id: "one" }, { id: "two" }]), /RPC timeout after 15ms/);
+  const abort = new AbortController();
+  let calls = 0;
+  const client = new FailoverHiveRpcClient(["https://one.test", "https://two.test"], (endpoint) =>
+    new HiveRpcClient(endpoint, async (_url, init) => {
+      calls += 1;
+      abort.abort();
+      throw init.signal.reason;
+    }));
+  await assert.rejects(client.getBlock(1, abort.signal), { name: "AbortError" });
+  assert.equal(calls, 1);
+});
