@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { parseArgs, runFollowLog } from "../dist/cli.js";
@@ -66,6 +69,14 @@ test("built CLI entrypoint is executable as a package bin", async () => {
 
   const { stdout } = await execFileAsync(cli.pathname, ["--help"]);
   assert.match(stdout, /^hivetop\n/);
+
+  const directory = await mkdtemp(join(tmpdir(), "hivetop-bin-"));
+  try {
+    const command = join(directory, "hivetop");
+    await symlink(fileURLToPath(cli), command);
+    const linked = await execFileAsync(command, ["--help"], { cwd: tmpdir() });
+    assert.equal(linked.stdout, stdout);
+  } finally { await rm(directory, { recursive: true }); }
 });
 
 test("CLI accepts terminal options and rejects invalid views/timeouts", () => {

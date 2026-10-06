@@ -9,6 +9,18 @@ It follows blocks through Hive JSON-RPC, aggregates recent block/transaction/ope
 Requires **Node 24 or newer**. With nvm, run `nvm use` in this directory
 (`nvm install` if you do not yet have Node 24).
 
+To install the `hivetop` command, run these once from this repository:
+
+```bash
+nvm use
+npm link
+```
+
+Then run `hivetop` or `hivetop --view sizes` from any directory. The command
+links to this checkout, so pulling updates also updates the command. With nvm,
+the link belongs to the selected Node installation; use `nvm use 24` in new
+shells if needed. After editing TypeScript, run `npm run build` as usual.
+
 ```bash
 npm start
 npm start -- --view round
