@@ -64,11 +64,11 @@ test("block-size charts preserve time gaps and peaks, support filtering, and fit
   ];
   const lines = blockSizeChartLines(blocks, 12, 10, 22);
   assert.equal(lines.length, 10);
-  assert.equal(lines[7], "         |███      ███");
+  assert.equal(stripAnsi(lines[7]), "         |███      ███");
   assert.match(lines[1], /Latest 1.0 KiB \| Mean 640 B/);
   assert.match(lines[2], /Min 256 B \| Peak 1.0 KiB \| 2\/2 blocks/);
   const merged = blockSizeChartLines(blocks, 12, 10, 11, true);
-  assert.equal(merged[3], " 1.0 KiB |#"); // One column keeps the larger sample.
+  assert.equal(stripAnsi(merged[3]), " 1.0 KiB |#"); // One column keeps the larger sample.
   const filtered = blockSizeChartLines(blocks, 12, 10, 30, true, "alice");
   assert.match(filtered[1], /Latest 256 B \| Mean 256 B/);
   assert.match(filtered[9], /00:00:00.*00:00:12/); // Filtering keeps the same time axis.
@@ -77,6 +77,14 @@ test("block-size charts preserve time gaps and peaks, support filtering, and fit
   const boundary = { ...blockRecord(0), timestamp: new Date("2026-10-06T00:00:00Z"), sizeBytes: 8192 };
   assert.ok(blockSizeChartLines([...blocks, boundary], 12, 10, 22)[3].endsWith(" ".repeat(12)));
   assert.equal(/[^\x00-\x7f]/.test(filtered.join("\n")), false);
+  assert.match(lines[7], /\x1b\[38;5;252m██\x1b\[38;5;244m█/);
+  const equalBlocks = [{ ...blocks[0], sizeBytes: 256 }, { ...blocks[1], timestamp: new Date("2026-10-06T00:00:09Z") }];
+  const shaded = blockSizeChartLines(equalBlocks, 12, 10, 22);
+  assert.match(shaded[7], /\x1b\[38;5;252m██\x1b\[38;5;244m█\x1b\[38;5;252m██\x1b\[38;5;244m█/);
+  const plain = blockSizeChartLines(equalBlocks, 12, 10, 22, false, "", true);
+  assert.deepEqual(shaded.map(stripAnsi), plain);
+  assert.equal(plain.some((line) => line.includes("\x1b")), false);
+  assert.equal(merged.some((line) => line.includes("38;5;244")), false);
 });
 
 test("size measurements run only in their view, cancel on leaving, cache results, and back off on errors", async () => {

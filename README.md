@@ -34,6 +34,8 @@ It shows the latest measured size, mean, minimum, and peak. The vertical scale
 adapts to the peak in the window; axes use KiB (1024 bytes) and UTC time.
 Blocks sharing a chart column use their peak size. Empty or unmeasured slots
 stay blank. `--ascii` uses `#` for the filled chart.
+Light bar faces and darker right edges give each block a shadow, including
+adjacent blocks of equal size. `--no-color` keeps the chart monochrome.
 
 Size measurements run in the background only while this view is visible.
 Each block needs an extra block fetch and one `get_transaction_hex` call;

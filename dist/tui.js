@@ -290,7 +290,7 @@ export class TerminalUi {
             tableLines = txStatusTableLines(this.txStatusMonitor, this.scroll, tableRows, mainWidth, selection, Boolean(this.options.ascii || this.noColor));
         }
         else if (this.view === "sizes") {
-            tableLines = blockSizeChartLines(snapshot.blocks, this.options.windowSeconds, tableBudget - (this.sizeError ? 1 : 0), mainWidth, Boolean(this.options.ascii), this.witnessFilter);
+            tableLines = blockSizeChartLines(snapshot.blocks, this.options.windowSeconds, tableBudget - (this.sizeError ? 1 : 0), mainWidth, Boolean(this.options.ascii), this.witnessFilter, this.noColor);
             if (this.sizeError)
                 tableLines.splice(1, 0, `Size RPC: ${this.sizeError}`);
         }
@@ -812,7 +812,7 @@ function isTransactionStatusApiUnavailable(error, message) {
         return false;
     return /unknown api|method not found|could not find api|does not exist|no method with name/i.test(message);
 }
-export function blockSizeChartLines(blocks, windowSeconds, rows, width, ascii = false, witnessFilter = "") {
+export function blockSizeChartLines(blocks, windowSeconds, rows, width, ascii = false, witnessFilter = "", noColor = false) {
     const filtered = blocks.filter((block) => block.witness.includes(witnessFilter));
     const measured = filtered.filter((block) => Number.isFinite(block.sizeBytes) && block.sizeBytes >= 0);
     const lines = ["BLOCK SIZE (bytes)"];
@@ -831,6 +831,7 @@ export function blockSizeChartLines(blocks, windowSeconds, rows, width, ascii = 
     const start = end - duration;
     const scale = Math.max(1024, Math.ceil(peak / 1024) * 1024);
     const buckets = Array(columns).fill(undefined);
+    const owners = Array(columns).fill(undefined);
     // A block covers the three-second slot ending at its timestamp. Empty slots stay blank.
     // When several blocks share a column, keep the peak rather than hide a size spike.
     for (const block of measured) {
@@ -839,17 +840,31 @@ export function blockSizeChartLines(blocks, windowSeconds, rows, width, ascii = 
             continue;
         const left = Math.max(0, Math.min(columns - 1, Math.floor((time - 3000 - start) / duration * columns)));
         const right = Math.max(left + 1, Math.min(columns, Math.ceil((time - start) / duration * columns)));
-        for (let column = left; column < right; column++)
-            buckets[column] = Math.max(buckets[column] ?? 0, block.sizeBytes);
+        for (let column = left; column < right; column++) {
+            if (block.sizeBytes > (buckets[column] ?? -1) || (block.sizeBytes === buckets[column] && block.number > owners[column])) {
+                buckets[column] = block.sizeBytes;
+                owners[column] = block.number;
+            }
+        }
     }
     for (let row = 0; row < height; row++) {
         const label = row === 0 || row === Math.floor(height / 2) ? formatBytes(scale * (height - row) / height) : "";
-        const cells = buckets.map((size) => {
+        let previousShade;
+        const cells = buckets.map((size, column) => {
             const parts = size === undefined ? 0 : Math.ceil(size / scale * height * 8);
             const fill = Math.max(0, Math.min(8, parts - (height - row - 1) * 8));
-            return ascii ? (fill ? "#" : " ") : " ▁▂▃▄▅▆▇█"[fill];
+            const glyph = ascii ? (fill ? "#" : " ") : " ▁▂▃▄▅▆▇█"[fill];
+            if (!fill || noColor)
+                return glyph;
+            // Shade the right edge of each block, even when adjacent blocks have equal sizes.
+            // A one-column bar keeps its light face so compressed history remains readable.
+            const shadow = column > 0 && owners[column - 1] === owners[column] && owners[column + 1] !== owners[column];
+            const shade = shadow ? 244 : 252;
+            const style = shade === previousShade ? "" : `\x1b[38;5;${shade}m`;
+            previousShade = shade;
+            return style + glyph;
         }).join("");
-        lines.push(`${label.padStart(8)} |${cells}`);
+        lines.push(`${label.padStart(8)} |${cells}${previousShade === undefined ? "" : "\x1b[39m"}`);
     }
     lines.push(`${"0 B".padStart(8)} +${"-".repeat(columns)}`);
     const firstTime = new Date(start).toISOString().slice(11, 19);
