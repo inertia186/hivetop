@@ -2,15 +2,24 @@
   "name": "hivetop",
   "version": "0.1.0",
   "description": "An htop-like terminal monitor for the Hive blockchain.",
+  "license": "CC0-1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inertia186/hivetop.git"
+  },
   "type": "module",
   "bin": {
     "hivetop": "./dist/cli.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "start": "node ./dist/cli.js",
     "dev": "node ./dist/cli.js",
     "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "npm test",
     "build": "tsc -p tsconfig.json && node ./scripts/make-cli-executable.mjs"
   },
   "engines": {

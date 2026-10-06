@@ -6,31 +6,32 @@ It follows blocks through Hive JSON-RPC, aggregates recent block/transaction/ope
 
 ## Usage
 
-Requires **Node 24 or newer**. With nvm, run `nvm use` in this directory
-(`nvm install` if you do not yet have Node 24).
+Requires **Node 24 or newer**. With nvm, run `nvm install 24`.
 
-To install the `hivetop` command, run these once from this repository:
+After the first release is published to npm, install the command with:
 
 ```bash
-nvm use
-npm link
+npm install --global hivetop
+hivetop
 ```
 
-Then run `hivetop` or `hivetop --view sizes` from any directory. The command
-links to this checkout, so pulling updates also updates the command. With nvm,
-the link belongs to the selected Node installation; use `nvm use 24` in new
-shells if needed. After editing TypeScript, run `npm run build` as usual.
+Or run it without a global install:
 
 ```bash
-npm start
-npm start -- --view round
-npm start -- --view sizes
-npm start -- --view txstatus --compact --ascii
-npm start -- --node https://api.hive.blog
-npm start -- --start 98765432
-npm start -- --window 120 --poll-ms 1000
-npm start -- --follow --node https://api.hive.blog --limit 42
-NO_COLOR=1 npm start
+npx hivetop
+```
+
+Run `hivetop` from any directory. Examples:
+
+```bash
+hivetop --view round
+hivetop --view sizes
+hivetop --view txstatus --compact --ascii
+hivetop --node https://api.hive.blog
+hivetop --start 98765432
+hivetop --window 120 --poll-ms 1000
+hivetop --follow --node https://api.hive.blog --limit 42
+NO_COLOR=1 hivetop
 ```
 
 The four views are blocks, the witness schedule (`round`), transaction
@@ -130,6 +131,18 @@ at 24 hours, so the reason for a witness's different appearance is visible.
 
 The runtime is dependency-free and checked into `dist/` so it can run without installing packages. TypeScript source lives in `src/`; after installing dependencies, `npm run build` regenerates `dist/`.
 
+To install the command from this checkout:
+
+```bash
+nvm use
+npm ci
+npm link
+```
+
+The command links to this checkout, so pulling updates also updates the command.
+With nvm, the link belongs to the selected Node installation; use `nvm use 24`
+in new shells if needed. `npm start` also runs the app directly from the checkout.
+
 ```bash
 npm test
 npm run build
@@ -138,3 +151,21 @@ npm run build
 GitHub Actions runs the tests on Node 24 and verifies that rebuilding does not
 change the checked-in `dist/` files. Run `npm ci` after cloning to install the
 development tools. Runtime dependencies are provided by Node itself.
+
+## Publishing
+
+From this repository with Node 24 or newer:
+
+```bash
+npm ci
+npm login
+npm publish --access public
+```
+
+Publishing builds the runtime and runs the tests first. The package includes
+only `dist/`, `package.json`, this README, and the license. Use
+`npm pack --dry-run` to review the file list before publishing.
+
+## License
+
+[CC0 1.0 Universal](LICENSE).

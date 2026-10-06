@@ -38,7 +38,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.ar
 }
 
 async function main(): Promise<void> {
-  if (Number(process.versions.node.split(".")[0]) < 24) throw new Error("hivetop requires Node 24 or newer. Run `nvm use` in this project.");
+  if (Number(process.versions.node.split(".")[0]) < 24) throw new Error("hivetop requires Node 24 or newer. With nvm, run `nvm install 24`.");
   const options = parseArgs(process.argv.slice(2));
   if (!options.follow && (!process.stdin.isTTY || !process.stdout.isTTY)) throw new Error("The dashboard needs an interactive terminal. Use --follow for JSON output.");
   const abort = new AbortController();
@@ -313,6 +313,6 @@ are marked unavailable/stale and retried every 30 seconds.
 --compact hides the sidebar and uses fewer columns; narrow terminals adapt
 automatically. --ascii uses status letters; --no-color or a nonempty NO_COLOR
 environment variable disables colors and also uses distinct status letters.
-Requires Node 24+. Run nvm use if you use nvm.
+Requires Node 24+. With nvm, run nvm install 24.
 `);
 }
