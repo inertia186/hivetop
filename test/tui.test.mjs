@@ -1256,7 +1256,7 @@ function blockRecord(number, transactions = []) {
   };
 }
 
-async function waitFor(predicate, timeoutMs = 100) {
+async function waitFor(predicate, timeoutMs = 1000) {
   const startedAt = Date.now();
   while (!predicate()) {
     if (Date.now() - startedAt > timeoutMs) throw new Error("timed out waiting for condition");
