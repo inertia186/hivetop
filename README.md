@@ -3,6 +3,7 @@
 ![hivetop logo](logo.png)
 
 [![Tests](https://github.com/inertia186/hivetop/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/inertia186/hivetop/actions/workflows/test.yml)
+[![npm version](https://img.shields.io/npm/v/hivetop.svg)](https://www.npmjs.com/package/hivetop)
 [![CC0-1.0](https://img.shields.io/badge/license-CC0--1.0-lightgrey.svg)](LICENSE)
 
 `hivetop` is an htop-like terminal monitor for the Hive blockchain.
@@ -13,7 +14,7 @@ It follows blocks through Hive JSON-RPC, aggregates recent block/transaction/ope
 
 Requires **Node 24 or newer**. With nvm, run `nvm install 24`.
 
-After the first release is published to npm, install the command with:
+Install the command from [npm](https://www.npmjs.com/package/hivetop):
 
 ```bash
 npm install --global hivetop
