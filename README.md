@@ -10,6 +10,9 @@
 
 It follows blocks through Hive JSON-RPC, aggregates recent block/transaction/operation rates, and renders a live terminal dashboard.
 
+For screenshots and discussion, see the
+[launch post on PeakD](https://peakd.com/hive-139531/@inertia/hivetop--a-cli-hive-monitor).
+
 ## Installation
 
 Requires **Node 24 or newer**. With nvm, run `nvm install 24`.
