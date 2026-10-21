@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   BlockFollower,
-  majorityHighestVersion,
   missedBlocksFromVirtualOperations,
   scheduleRound,
   summarizeRcStats,
@@ -40,7 +39,7 @@ test("toBlockRecord counts transactions and operation types", () => {
   assert.equal(record.operationTypes.get("comment"), 1);
 });
 
-test("BlockFollower starts from an explicit block and follows sequentially", async () => {
+test("BlockFollower follows sequentially using the chain's majority version", async () => {
   let hardforkVersionCalls = 0;
   const client = {
     async getDynamicGlobalProperties() {
@@ -64,7 +63,7 @@ test("BlockFollower starts from an explicit block and follows sequentially", asy
       return { hf_version: "1.29.0", live_time: "2026-07-01T00:00:00" };
     },
     async getWitnessSchedule() {
-      return { current_shuffled_witnesses: ["alice", "bob", "carol"], num_scheduled_witnesses: 3 };
+      return { current_shuffled_witnesses: ["alice", "bob", "carol"], num_scheduled_witnesses: 3, majority_version: "1.28.2" };
     },
     async getWitnessesByVote() {
       return [
@@ -97,7 +96,7 @@ test("BlockFollower starts from an explicit block and follows sequentially", asy
     { "witness-10": "2026-06-16T19:00:00", "witness-11": "2026-06-16T18:00:00" },
   ]);
   assert.deepEqual(events.map((event) => event.witnessVersions), [{ "witness-10": "1.28.3", "witness-11": "1.28.3" }, { "witness-10": "1.28.3", "witness-11": "1.28.3" }]);
-  assert.deepEqual(events.map((event) => event.majorityWitnessVersion), ["1.28.3", "1.28.3"]);
+  assert.deepEqual(events.map((event) => event.majorityWitnessVersion), ["1.28.2", "1.28.2"]);
   assert.deepEqual(events.map((event) => event.missedBlocks), [[], []]);
   assert.equal(hardforkVersionCalls, 1);
 });
@@ -118,6 +117,7 @@ test("BlockFollower replaces witness schedule when head block enters a new sched
     { head_block_number: 102, time: "2026-06-16T20:00:03" },
   ];
   let scheduleCalls = 0;
+  let witnessRankCalls = 0;
   const client = {
     async getDynamicGlobalProperties() {
       return props.shift() ?? { head_block_number: 102, time: "2026-06-16T20:00:03" };
@@ -137,11 +137,12 @@ test("BlockFollower replaces witness schedule when head block enters a new sched
     async getWitnessSchedule() {
       scheduleCalls += 1;
       return scheduleCalls === 1
-        ? { current_shuffled_witnesses: ["alice", "bob", "carol"], num_scheduled_witnesses: 3 }
-        : { current_shuffled_witnesses: ["dan", "erin", "frank"], num_scheduled_witnesses: 3 };
+        ? { current_shuffled_witnesses: ["alice", "bob", "carol"], num_scheduled_witnesses: 3, majority_version: "1.28.3" }
+        : { current_shuffled_witnesses: ["dan", "erin", "frank"], num_scheduled_witnesses: 3, majority_version: "1.28.7" };
     },
     async getWitnessesByVote() {
-      return [];
+      witnessRankCalls += 1;
+      return [{ owner: "alice", running_version: "1.28.3" }];
     },
     async getRcStats() {
       return rcStatsResponse();
@@ -157,6 +158,8 @@ test("BlockFollower replaces witness schedule when head block enters a new sched
   }
 
   assert.equal(scheduleCalls, 2);
+  assert.equal(witnessRankCalls, 1);
+  assert.deepEqual(events.map((event) => event.majorityWitnessVersion), ["1.28.3", "1.28.7"]);
   assert.deepEqual(events.map((event) => event.witnessSchedule.current_shuffled_witnesses), [
     ["alice", "bob", "carol"],
     ["dan", "erin", "frank"],
@@ -246,12 +249,6 @@ test("witnessVersionsByVote maps running versions by witness owner", () => {
     ]),
     { alice: "1.28.3" },
   );
-});
-
-test("majorityHighestVersion chooses the mode with highest-version tie break", () => {
-  assert.equal(majorityHighestVersion(["1.28.2", "1.28.3", "1.28.3", "1.28.4"]), "1.28.3");
-  assert.equal(majorityHighestVersion(["1.28.2", "1.28.3"]), "1.28.3");
-  assert.equal(majorityHighestVersion([]), undefined);
 });
 
 test("summarizeRcStats derives pressure signals", () => {
@@ -372,7 +369,7 @@ test("BlockFollower reports a gap when a block is null", async () => {
   assert.deepEqual(result.value.witnessRanks, { alice: 1 });
   assert.deepEqual(result.value.witnessFeedUpdates, { alice: "2026-06-16T19:00:00" });
   assert.deepEqual(result.value.witnessVersions, { alice: "1.28.3" });
-  assert.equal(result.value.majorityWitnessVersion, "1.28.3");
+  assert.equal(result.value.majorityWitnessVersion, undefined);
   assert.deepEqual(result.value.missedBlocks, []);
 });
 

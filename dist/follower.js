@@ -17,7 +17,6 @@ export class BlockFollower {
     witnessRanks = {};
     witnessFeedUpdates = {};
     witnessVersions = {};
-    majorityWitnessVersion;
     witnessRanksFetchedAt = 0;
     rcInfo;
     rcInfoFetchedAt = 0;
@@ -131,7 +130,7 @@ export class BlockFollower {
             witnessRanks: this.witnessRanks,
             witnessFeedUpdates: this.witnessFeedUpdates,
             witnessVersions: this.witnessVersions,
-            majorityWitnessVersion: this.majorityWitnessVersion,
+            majorityWitnessVersion: this.witnessSchedule?.majority_version || undefined,
             scheduleDiagnostics: this.witnessScheduleDiagnostics,
             missedBlocks: this.missedBlocks,
         };
@@ -205,7 +204,6 @@ export class BlockFollower {
         this.witnessRanks = witnessRanksByVote(witnesses);
         this.witnessFeedUpdates = witnessFeedUpdatesByVote(witnesses);
         this.witnessVersions = witnessVersionsByVote(witnesses);
-        this.majorityWitnessVersion = majorityHighestVersion(Object.values(this.witnessVersions));
         this.witnessRanksFetchedAt = now;
         return this.witnessRanks;
     }
@@ -294,32 +292,6 @@ export function witnessVersionsByVote(witnesses) {
         }
         return versions;
     }, {});
-}
-export function majorityHighestVersion(versions) {
-    const counts = new Map();
-    for (const version of versions) {
-        if (version.length > 0)
-            counts.set(version, (counts.get(version) ?? 0) + 1);
-    }
-    return [...counts.entries()]
-        .sort((a, b) => b[1] - a[1] || compareVersions(b[0], a[0]))[0]?.[0];
-}
-function compareVersions(a, b) {
-    const aParts = parseVersion(a);
-    const bParts = parseVersion(b);
-    const length = Math.max(aParts.length, bParts.length);
-    for (let index = 0; index < length; index += 1) {
-        const diff = (aParts[index] ?? 0) - (bParts[index] ?? 0);
-        if (diff !== 0)
-            return diff;
-    }
-    return a.localeCompare(b);
-}
-function parseVersion(version) {
-    return version.split(".").map((part) => {
-        const parsed = Number(part);
-        return Number.isFinite(parsed) ? parsed : 0;
-    });
 }
 function hardforkVersion(next) {
     return next.hf_version ?? next.hardfork_version;

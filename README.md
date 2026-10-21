@@ -135,9 +135,13 @@ ASCII transaction legend: `*` checking, `I` irreversible, `R` reversible,
 Stretched cells share one transaction's status. In the witness view, `√` (ASCII
 `+`) means the expected witness produced, `x` means a miss backed by chain
 evidence, and `?` means the schedule is unverified.
-The VERSION cell is highlighted yellow when it differs from the majority
-witness version. The FEED cell is highlighted yellow after 6 hours and red
-at 24 hours, so the reason for a witness's different appearance is visible.
+The VERSION cell is highlighted yellow when its full version string differs
+from the witness schedule's `majority_version`. Hive uses the hardfork witness
+threshold (17 of 21 on mainnet): the highest version that at least that many
+scheduled witnesses run or exceed. See [Hive's consensus calculation](https://github.com/openhive-network/hive/blob/master/libraries/chain/witness_schedule.cpp).
+If the schedule doesn't report a majority version, no version mismatch is highlighted.
+The FEED cell is highlighted yellow after 6 hours and red at 24 hours, so the
+reason for a witness's different appearance is visible.
 
 ## Troubleshooting
 
@@ -189,6 +193,44 @@ npm run build
 GitHub Actions runs the tests on Node 24 and verifies that rebuilding does not
 change the checked-in `dist/` files. Run `npm ci` after cloning to install the
 development tools. Runtime dependencies are provided by Node itself.
+
+### Renderer A/B experiment
+
+With Node 24 selected and development dependencies installed, run
+`npm run ab:tui` to compare the previous candidate (A) with the rebuilt
+working-tree renderer (B). A includes ANSI-safe clipping and duplicate-frame
+suppression. B also redraws only changed rows, clears shorter or removed rows,
+and repaints the full screen after resizing. The normal checkout runs B.
+
+A is reconstructed from commit `5aaf3c28` plus the checked-in
+`scripts/fixtures/tui-ab-baseline.patch`, with its resulting SHA-256 verified
+before each run. This preserves the previous experiment without needing a
+commit of the working tree. The command requires Git and that commit in local
+history. Advance the baseline deliberately after accepting an improvement;
+keep it fixed while comparing changes.
+
+The comparison uses fixed data without RPC, all four views, three terminal
+sizes, and color, no-color, and ASCII output. It replays both output streams
+through xterm's headless emulator and compares every visible cell, including
+colors and styles, after input, animation, and resize transitions. The emulator
+is a development dependency; the runtime still has no package dependencies.
+
+Timing excludes the emulator and uses seven trials with alternating A/B order.
+It reports output bytes, writes, and frame-construction time with an in-memory
+sink, not actual terminal paint latency. Both repeated frames and an
+every-frame-changes control are measured. Wide Unicode character widths remain
+outside this experiment.
+
+To try each version interactively, quit one before starting the other:
+
+```bash
+npm run ab:tui -- --live A --view round --node https://api.hive.blog
+npm run ab:tui -- --live B --view round --node https://api.hive.blog
+```
+
+Both accept the regular CLI options and controls. Live sessions use changing
+chain data; use the automated comparison for identical inputs. A is extracted
+into a temporary directory that is removed when the command exits.
 
 ## Contributing
 
