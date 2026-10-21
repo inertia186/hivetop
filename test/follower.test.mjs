@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { MetricsStore } from "../dist/metrics.js";
 import {
   BlockFollower,
   missedBlocksFromVirtualOperations,
@@ -99,6 +100,38 @@ test("BlockFollower follows sequentially using the chain's majority version", as
   assert.deepEqual(events.map((event) => event.majorityWitnessVersion), ["1.28.2", "1.28.2"]);
   assert.deepEqual(events.map((event) => event.missedBlocks), [[], []]);
   assert.equal(hardforkVersionCalls, 1);
+});
+
+test("resetting to an unchanged head preserves a single block and unchanged metrics", async () => {
+  const client = {
+    async getDynamicGlobalProperties() { return { head_block_number: 42, time: "2026-06-16T20:00:00" }; },
+    async getBlock() { return { timestamp: "2026-06-16T20:00:00", witness: "alice", transactions: [{ operations: [["vote", {}]] }] }; },
+    async getVirtualOperationsInBlock() { return []; },
+    async getWitnessSchedule() { return { current_shuffled_witnesses: ["alice", "bob", "carol"] }; },
+    async getWitnessesByVote() { return []; },
+    async getHardforkVersion() { return "1.28.0"; },
+    async getNextScheduledHardfork() { return {}; },
+    async getRcStats() { return {}; },
+  };
+  const abort = new AbortController();
+  const follower = new BlockFollower(client, { pollMs: 1, retryMs: 1 });
+  const iterator = follower.follow(abort.signal);
+  const metrics = new MetricsStore(120);
+  try {
+    const first = (await iterator.next()).value;
+    assert.equal(first.type, "block");
+    metrics.record(first.block);
+    const before = metrics.snapshot();
+    follower.resetToHead();
+    const repeated = (await iterator.next()).value;
+    assert.equal(repeated.type, "block");
+    assert.equal(repeated.block.number, first.block.number);
+    metrics.record(repeated.block);
+    assert.deepEqual(metrics.snapshot(), before);
+  } finally {
+    abort.abort();
+    await iterator.return();
+  }
 });
 
 test("witnessRanksByVote derives HiveHub-style ranks from get_witnesses_by_vote order", () => {

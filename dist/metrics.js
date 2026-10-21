@@ -1,14 +1,16 @@
 export class MetricsStore {
     windowSeconds;
-    maxBlocks;
     blocks = [];
     latestBlockTime;
-    constructor(windowSeconds, maxBlocks = 300) {
+    constructor(windowSeconds) {
         this.windowSeconds = windowSeconds;
-        this.maxBlocks = maxBlocks;
     }
     record(block, now = block.timestamp) {
-        this.blocks.unshift(block);
+        const existingIndex = this.blocks.findIndex((entry) => entry.number === block.number);
+        if (existingIndex < 0)
+            this.blocks.unshift(block);
+        else
+            this.blocks[existingIndex] = block;
         if (!this.latestBlockTime || block.timestamp.getTime() > this.latestBlockTime.getTime()) {
             this.latestBlockTime = block.timestamp;
         }
@@ -43,9 +45,7 @@ export class MetricsStore {
     }
     evict(now) {
         const cutoff = now.getTime() - this.windowSeconds * 1000;
-        this.blocks = this.blocks
-            .filter((block) => block.timestamp.getTime() >= cutoff)
-            .slice(0, this.maxBlocks);
+        this.blocks = this.blocks.filter((block) => block.timestamp.getTime() >= cutoff);
     }
 }
 function sortedEntries(map) {

@@ -14,10 +14,12 @@ export class MetricsStore {
   private blocks: BlockRecord[] = [];
   private latestBlockTime: Date | undefined;
 
-  constructor(private readonly windowSeconds: number, private readonly maxBlocks = 300) {}
+  constructor(private readonly windowSeconds: number) {}
 
   record(block: BlockRecord, now = block.timestamp): void {
-    this.blocks.unshift(block);
+    const existingIndex = this.blocks.findIndex((entry) => entry.number === block.number);
+    if (existingIndex < 0) this.blocks.unshift(block);
+    else this.blocks[existingIndex] = block;
     if (!this.latestBlockTime || block.timestamp.getTime() > this.latestBlockTime.getTime()) {
       this.latestBlockTime = block.timestamp;
     }
@@ -56,9 +58,7 @@ export class MetricsStore {
 
   private evict(now: Date): void {
     const cutoff = now.getTime() - this.windowSeconds * 1000;
-    this.blocks = this.blocks
-      .filter((block) => block.timestamp.getTime() >= cutoff)
-      .slice(0, this.maxBlocks);
+    this.blocks = this.blocks.filter((block) => block.timestamp.getTime() >= cutoff);
   }
 }
 

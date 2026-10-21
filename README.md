@@ -81,7 +81,9 @@ for available Hive API nodes. It follows `api.hive.blog` while its Beacon score
 is at least `90`; below that threshold, it switches to the highest-scored node
 that advertises `get_rc_stats`. During runtime it uses the same Beacon-ordered
 node list for basic failover when RPC calls fail. Pass `--node` to pin a
-specific endpoint and disable Beacon failover.
+specific endpoint and disable Beacon failover. Beacon discovery, including its
+response body, has a 10-second deadline and falls back to `api.hive.blog` if it
+cannot complete in time.
 
 Each RPC request, including its response body, has a 10-second deadline;
 override it with `--rpc-timeout-ms MS`. The header shows the age of the latest

@@ -85,6 +85,90 @@ test("selectHiveNode reads Beacon and returns the chosen endpoint", async () => 
   assert.deepEqual(selected.endpoints, ["https://api.openhive.network", fallbackEndpoint]);
 });
 
+for (const stage of ["request", "body"]) {
+  test(`selectHiveNode times out a stalled ${stage} and falls back`, async (context) => {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const caller = new AbortController();
+    let signal;
+    let notify;
+    const started = new Promise(resolve => { notify = resolve; });
+    const stall = (activeSignal) => {
+      signal = activeSignal;
+      notify();
+      return waitForAbort(signal);
+    };
+    const selection = selectHiveNode({
+      fallbackEndpoint, signal: caller.signal,
+      fetchImpl: (_url, init) => stage === "request" ? stall(init.signal)
+        : Promise.resolve({ ok: true, status: 200, json: () => stall(init.signal) }),
+    });
+    try {
+      await started;
+      context.mock.timers.tick(9999);
+      assert.equal(signal.aborted, false);
+      context.mock.timers.tick(1);
+      const timedOut = signal.aborted;
+      caller.abort(); // Settle the old implementation too, so failures do not hang.
+      assert.equal((await selection).source, "fallback");
+      assert.equal(timedOut, true);
+    } finally { caller.abort(); }
+  });
+}
+
+test("selectHiveNode preserves caller cancellation while reading a stalled body", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const caller = new AbortController();
+  let signal;
+  let notify;
+  const started = new Promise(resolve => { notify = resolve; });
+  const selection = selectHiveNode({
+    fallbackEndpoint, signal: caller.signal,
+    fetchImpl: async (_url, init) => ({ ok: true, status: 200, json: () => {
+      signal = init.signal;
+      notify();
+      return waitForAbort(signal);
+    } }),
+  });
+  await started;
+  caller.abort(new Error("shutdown"));
+  assert.equal((await selection).source, "fallback");
+  assert.equal(signal.aborted, true);
+  assert.equal(signal.reason, caller.signal.reason);
+});
+
+test("selectHiveNode skips discovery when the caller is already aborted", async () => {
+  const caller = new AbortController();
+  caller.abort();
+  let requested = false;
+  const selected = await selectHiveNode({
+    fallbackEndpoint, signal: caller.signal,
+    fetchImpl: async () => { requested = true; return { ok: true, status: 200, json: async () => [] }; },
+  });
+  assert.equal(selected.source, "fallback");
+  assert.equal(requested, false);
+});
+
+test("selectHiveNode clears the discovery deadline after completion", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const caller = new AbortController();
+  let signal;
+  await selectHiveNode({
+    fallbackEndpoint, signal: caller.signal,
+    fetchImpl: async (_url, init) => {
+      signal = init.signal;
+      return { ok: true, status: 200, json: async () => [node("api.hive.blog", fallbackEndpoint, 100, 24, 105)] };
+    },
+  });
+  context.mock.timers.tick(10_000);
+  assert.equal(signal.aborted, false);
+});
+
+function waitForAbort(signal) {
+  return new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+}
+
 function node(name, endpoint, score, success, lastBlock) {
   return { name, endpoint, score, success, lastBlock, features: rcFeatures };
 }

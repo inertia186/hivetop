@@ -4,8 +4,12 @@ export const BEACON_NODES_URL = "https://beacon.peakd.com/api/nodes";
 export const PREFERRED_NODE_NAME = "api.hive.blog";
 export const PREFERRED_NODE_SCORE_THRESHOLD = 90;
 export async function selectHiveNode(options) {
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), 10_000);
     try {
-        const nodes = await fetchBeaconNodes(options.beaconUrl ?? BEACON_NODES_URL, options.fetchImpl ?? defaultFetch, options.signal);
+        const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+        signal.throwIfAborted();
+        const nodes = await fetchBeaconNodes(options.beaconUrl ?? BEACON_NODES_URL, options.fetchImpl ?? defaultFetch, signal);
         const selected = chooseBeaconNode(nodes, options.fallbackEndpoint);
         const endpoints = orderedBeaconEndpoints(nodes, options.fallbackEndpoint);
         if (selected?.endpoint)
@@ -13,6 +17,9 @@ export async function selectHiveNode(options) {
     }
     catch {
         return fallbackSelection(options.fallbackEndpoint);
+    }
+    finally {
+        clearTimeout(timer);
     }
     return fallbackSelection(options.fallbackEndpoint);
 }
