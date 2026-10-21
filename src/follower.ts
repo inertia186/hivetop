@@ -46,7 +46,6 @@ export class BlockFollower {
   private witnessRanks: WitnessRanks = {};
   private witnessFeedUpdates: WitnessFeedUpdates = {};
   private witnessVersions: WitnessVersions = {};
-  private majorityWitnessVersion: string | undefined;
   private witnessRanksFetchedAt = 0;
   private rcInfo: RcInfo | undefined;
   private rcInfoFetchedAt = 0;
@@ -174,7 +173,7 @@ export class BlockFollower {
       witnessRanks: this.witnessRanks,
       witnessFeedUpdates: this.witnessFeedUpdates,
       witnessVersions: this.witnessVersions,
-      majorityWitnessVersion: this.majorityWitnessVersion,
+      majorityWitnessVersion: this.witnessSchedule?.majority_version || undefined,
       scheduleDiagnostics: this.witnessScheduleDiagnostics,
       missedBlocks: this.missedBlocks,
     };
@@ -250,7 +249,6 @@ export class BlockFollower {
     this.witnessRanks = witnessRanksByVote(witnesses);
     this.witnessFeedUpdates = witnessFeedUpdatesByVote(witnesses);
     this.witnessVersions = witnessVersionsByVote(witnesses);
-    this.majorityWitnessVersion = majorityHighestVersion(Object.values(this.witnessVersions));
     this.witnessRanksFetchedAt = now;
     return this.witnessRanks;
   }
@@ -349,34 +347,6 @@ export function witnessVersionsByVote(witnesses: WitnessByVote[]): WitnessVersio
     }
     return versions;
   }, {});
-}
-
-export function majorityHighestVersion(versions: string[]): string | undefined {
-  const counts = new Map<string, number>();
-  for (const version of versions) {
-    if (version.length > 0) counts.set(version, (counts.get(version) ?? 0) + 1);
-  }
-
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || compareVersions(b[0], a[0]))[0]?.[0];
-}
-
-function compareVersions(a: string, b: string): number {
-  const aParts = parseVersion(a);
-  const bParts = parseVersion(b);
-  const length = Math.max(aParts.length, bParts.length);
-  for (let index = 0; index < length; index += 1) {
-    const diff = (aParts[index] ?? 0) - (bParts[index] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return a.localeCompare(b);
-}
-
-function parseVersion(version: string): number[] {
-  return version.split(".").map((part) => {
-    const parsed = Number(part);
-    return Number.isFinite(parsed) ? parsed : 0;
-  });
 }
 
 function hardforkVersion(next: NextScheduledHardfork): string | undefined {

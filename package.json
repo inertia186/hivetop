@@ -1,6 +1,6 @@
 {
   "name": "hivetop",
-  "version": "1.8.0",
+  "version": "1.10.0",
   "description": "An htop-like terminal monitor for the Hive blockchain.",
   "license": "CC0-1.0",
   "repository": {
@@ -18,6 +18,8 @@
   "scripts": {
     "start": "node ./dist/cli.js",
     "dev": "node ./dist/cli.js",
+    "preab:tui": "npm run build",
+    "ab:tui": "node ./scripts/tui-ab.mjs",
     "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
     "prepublishOnly": "npm test",
@@ -28,6 +30,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.19.1",
+    "@xterm/headless": "6.0.0",
     "typescript": "^5.8.0"
   }
 }

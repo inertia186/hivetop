@@ -37,13 +37,19 @@ export async function selectHiveNode(options: {
   fetchImpl?: BeaconFetch;
   signal?: AbortSignal;
 }): Promise<NodeSelection> {
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), 10_000);
   try {
-    const nodes = await fetchBeaconNodes(options.beaconUrl ?? BEACON_NODES_URL, options.fetchImpl ?? defaultFetch, options.signal);
+    const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+    signal.throwIfAborted();
+    const nodes = await fetchBeaconNodes(options.beaconUrl ?? BEACON_NODES_URL, options.fetchImpl ?? defaultFetch, signal);
     const selected = chooseBeaconNode(nodes, options.fallbackEndpoint);
     const endpoints = orderedBeaconEndpoints(nodes, options.fallbackEndpoint);
     if (selected?.endpoint) return { endpoint: selected.endpoint, source: "beacon", node: selected, endpoints, nodes };
   } catch {
     return fallbackSelection(options.fallbackEndpoint);
+  } finally {
+    clearTimeout(timer);
   }
 
   return fallbackSelection(options.fallbackEndpoint);

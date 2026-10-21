@@ -90,6 +90,7 @@ export interface WitnessSchedule {
   future_changes?: unknown;
   num_scheduled_witnesses?: number;
   next_shuffle_block_num?: number;
+  majority_version?: string;
   rpcEndpoint?: string;
   rpcRequestId?: string;
   rpcParamHash?: string;

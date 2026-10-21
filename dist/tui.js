@@ -45,6 +45,7 @@ export class TerminalUi {
     latestEvent = null;
     latestDataEvent = null;
     latestSnapshot = null;
+    lastOutput;
     startedAt = Date.now();
     constructor(options) {
         this.options = options;
@@ -53,6 +54,7 @@ export class TerminalUi {
         this.txStatusMonitor = options.transactionStatusClient ? new TransactionStatusMonitor(options.transactionStatusClient) : undefined;
     }
     start() {
+        this.lastOutput = undefined;
         emitKeypressEvents(process.stdin);
         process.stdin.setEncoding("utf8");
         if (process.stdin.isTTY)
@@ -111,7 +113,7 @@ export class TerminalUi {
         }
         this.draw();
     }
-    onResize = () => { this.draw(); };
+    onResize = () => { this.lastOutput = undefined; this.draw(); };
     onKey = (chunk, key) => {
         chunk = key?.sequence ?? chunk ?? "";
         if (chunk === "\u0003" || (chunk === "q" && this.searchInput === undefined)) {
@@ -313,7 +315,11 @@ export class TerminalUi {
             output = stripAnsi(output);
         if (this.options.ascii)
             output = output.replace(/√/g, "+").replace(/─/g, "-").replace(/↑/g, "^").replace(/↓/g, "v").replace(/…/g, "~").replace(/[^\x00-\x7f]/g, "?");
-        process.stdout.write("\x1b[H" + output + "\x1b[J");
+        const update = terminalFrameUpdate(this.lastOutput, output);
+        if (update) {
+            process.stdout.write(update);
+            this.lastOutput = output;
+        }
     }
     nodeLabel() {
         return typeof this.options.node === "function" ? this.options.node() : this.options.node;
@@ -1490,12 +1496,49 @@ function formatOperationName(value) {
 function horizontal(columns) {
     return "─".repeat(columns);
 }
-function fit(input, columns) {
+export function terminalFrameUpdate(previous, output) {
+    if (previous === output)
+        return "";
+    // Clear before writing so an exactly full last row retains its bottom-right character.
+    if (previous === undefined)
+        return "\x1b[H\x1b[2J" + output;
+    const before = previous.split("\n");
+    const after = output.split("\n");
+    const reset = previous.includes("\x1b[") || output.includes("\x1b[") ? "\x1b[0m" : "";
+    let update = "";
+    for (let row = 0; row < Math.max(before.length, after.length); row++) {
+        if (before[row] === after[row])
+            continue;
+        // Absolute positioning avoids wrapping or scrolling through unchanged rows.
+        update += `\x1b[${row + 1};1H${reset}\x1b[2K${after[row] ?? ""}${reset}`;
+    }
+    return update;
+}
+export function fit(input, columns) {
+    if (columns <= 0)
+        return "";
     const visible = stripAnsi(input);
     if (visible.length === columns)
         return input;
-    if (visible.length > columns)
-        return input.slice(0, Math.max(0, columns - 1)) + "…";
+    if (visible.length > columns) {
+        if (!input.includes("\x1b"))
+            return input.slice(0, columns - 1) + "…";
+        let output = "";
+        let length = 0;
+        // Preserve complete SGR sequences when clipping the UI's single-column text.
+        // shortcut: width still uses UTF-16 units; use a width-aware library if wide Unicode text is supported.
+        for (const [token] of input.matchAll(/\x1b\[[0-9;]*m|./gs)) {
+            if (token.startsWith("\x1b["))
+                output += token;
+            else {
+                if (length >= columns - 1)
+                    break;
+                output += token;
+                length += 1;
+            }
+        }
+        return output + "…" + (output.includes("\x1b[") ? "\x1b[0m" : "");
+    }
     return input + " ".repeat(columns - visible.length);
 }
 function color(text, _fg, _bg) {

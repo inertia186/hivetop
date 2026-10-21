@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { stripVTControlCharacters as stripAnsi } from "node:util";
+import { TerminalScreen } from "./helpers/terminal-screen.mjs";
 import {
   blockSizeChartLines,
+  fit,
   clampedScrollStart,
   formatFeedAge,
   formatMaintenanceCountdown,
@@ -34,8 +36,90 @@ import {
   splitReplacementPredictions,
   stabilizeObservedRoundRows,
   TerminalUi,
+  terminalFrameUpdate,
   TransactionStatusMonitor,
 } from "../dist/tui.js";
+
+test("row updates preserve terminal cells, erase shorter and removed rows, and keep the bottom-right cell", async () => {
+  const incremental = new TerminalScreen(10, 4);
+  const reference = new TerminalScreen(10, 4);
+  let previous;
+  const frames = [
+    "unchanged!\n\x1b[1;31;7mcolored   \x1b[0m\nthird row!\n0123456789",
+    "unchanged!\n\x1b[1;32mgreen     \x1b[0m\nthird row!\n0123456789",
+    "unchanged!\nshort\nthird row!\n0123456789",
+    "unchanged!\nshort",
+    "unchanged!\nshort\nnew row!",
+    "",
+  ];
+  try {
+    for (const [index, frame] of frames.entries()) {
+      const update = terminalFrameUpdate(previous, frame);
+      if (index === 1) {
+        assert.equal((update.match(/\x1b\[\d+;1H/g) ?? []).length, 1);
+        assert.ok(!update.includes("unchanged!"));
+        assert.ok(!update.includes("third row!"));
+      }
+      incremental.write(update);
+      reference.write("\x1b[0m\x1b[H\x1b[2J" + frame);
+      assert.deepEqual(await incremental.cells(), await reference.cells());
+      if (index === 0) assert.ok((await incremental.text()).endsWith("0123456789"));
+      assert.equal(terminalFrameUpdate(frame, frame), "");
+      previous = frame;
+    }
+  } finally { incremental.dispose(); reference.dispose(); }
+});
+
+test("clipping preserves complete color sequences, resets styles, and fills the requested width", () => {
+  for (const width of [0, 1, 3, 8, 12]) {
+    const colored = "\x1b[1;31mabcdefghij\x1b[0m";
+    const output = fit(colored, width);
+    assert.equal(stripAnsi(output), fit("abcdefghij", width));
+    assert.equal(stripAnsi(output).length, width);
+    assert.equal(output.replace(/\x1b\[[0-9;]*m/g, "").includes("\x1b"), false);
+    if (width > 0 && width < 10) assert.ok(output.endsWith("\x1b[0m"));
+  }
+  const mixed = fit("ab\x1b[32mcdef\x1b[0mgh", 6);
+  assert.equal(stripAnsi(mixed), "abcde…");
+  assert.ok(mixed.includes("\x1b[32m"));
+  assert.ok(mixed.endsWith("\x1b[0m"));
+});
+
+test("identical frames skip writes but resize, input, and clock changes still repaint", () => {
+  const originalWrite = process.stdout.write;
+  const originalNow = Date.now;
+  let now = Date.parse("2026-10-12T12:00:00Z");
+  Date.now = () => now;
+  const writes = [];
+  process.stdout.write = (chunk) => { writes.push(String(chunk)); return true; };
+  const ui = new TerminalUi({ node: "test", windowSeconds: 120, onQuit() {}, onPauseToggle() {}, onReset() {} });
+  try {
+    const block = { ...blockRecord(104), timestamp: new Date(now) };
+    ui.render({ type: "block", block, headBlock: 104, lag: 0, witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] },
+      { blocks: [block], blockRate: 0.3, transactionRate: 1, operationRate: 2, virtualOperationRate: 0, operationTypes: [], witnesses: [] });
+    assert.equal(writes.length, 1);
+    ui.draw();
+    ui.onKey("z");
+    assert.equal(writes.length, 1);
+    ui.onResize();
+    assert.equal(writes.length, 2);
+    assert.equal(writes[0], writes[1]);
+    ui.onKey("?");
+    assert.equal(writes.length, 3);
+    assert.match(writes.at(-1), /HELP/);
+    now += 1000;
+    ui.draw();
+    assert.equal(writes.length, 4);
+    ui.stop();
+    const stoppedWrites = writes.length;
+    ui.draw();
+    assert.equal(writes.length, stoppedWrites);
+  } finally {
+    ui.stop();
+    process.stdout.write = originalWrite;
+    Date.now = originalNow;
+  }
+});
 
 test("headerSummary keeps normal live status stable", () => {
   assert.equal(
@@ -269,8 +353,7 @@ test("formatRankedWitnessCell styles the full padded witness column", () => {
 
 test("round rows highlight the specific version or feed difference", () => {
   const originalWrite = process.stdout.write;
-  let output = "";
-  process.stdout.write = (chunk) => { output = String(chunk); return true; };
+  process.stdout.write = () => true;
   const names = ["fresh", "old", "stale", "expired", "unknown"];
   const blocks = names.map((witness, index) => ({ ...blockRecord(index + 1), witness })).reverse();
   const snapshot = { blocks, blockRate: 0, transactionRate: 0, operationRate: 0, virtualOperationRate: 0, operationTypes: [], witnesses: [] };
@@ -281,7 +364,7 @@ test("round rows highlight the specific version or feed difference", () => {
     witnessVersions: { fresh: "1.28.7", old: "1.28.3", stale: "1.28.7", expired: "1.28.3" }, majorityWitnessVersion: "1.28.7",
     witnessFeedUpdates: { fresh: "2026-06-16T06:00:00", old: "2026-06-16T11:00:00", stale: "2026-06-16T05:59:00", expired: "2026-06-15T12:00:00" } };
   const ui = new TerminalUi({ node: "test", windowSeconds: 120, view: "round", noColor: false, onQuit() {}, onPauseToggle() {}, onReset() {} });
-  const row = (name) => output.split("\n").find((line) => stripAnsi(line).includes(`#${names.indexOf(name) + 1} ${name}`));
+  const row = (name) => ui.lastOutput.split("\n").find((line) => stripAnsi(line).includes(`#${names.indexOf(name) + 1} ${name}`));
   try {
     ui.render(event, snapshot);
     assert.match(row("old"), /\x1b\[1;33;7m1\.28\.3 {3}\x1b\[0m/);
@@ -296,7 +379,7 @@ test("round rows highlight the specific version or feed difference", () => {
     assert.doesNotMatch(row("old"), /\x1b\[1;33;7m1\.28\.3/);
     ui.noColor = true;
     ui.render(event, snapshot);
-    assert.doesNotMatch(output, /\x1b\[[0-9;]*m/);
+    assert.doesNotMatch(ui.lastOutput, /\x1b\[[0-9;]*m/);
   } finally { ui.stop(); process.stdout.write = originalWrite; }
 });
 
@@ -1012,7 +1095,7 @@ test("schedulePredictionsExpired suppresses future predictions after the shuffle
   assert.equal(schedulePredictionsExpired(announced, 108), true);
 });
 
-test("TerminalUi previews the announced round and promotes it without waiting for three blocks", () => {
+test("TerminalUi previews the announced round and promotes it without waiting for three blocks", async () => {
   const oldSchedule = {
     current_shuffled_witnesses: ["alice", "bob", "carol"],
     future_shuffled_witnesses: ["dan", "erin", "frank"], next_shuffle_block_num: 3,
@@ -1024,8 +1107,12 @@ test("TerminalUi previews the announced round and promotes it without waiting fo
   const ui = new TerminalUi({ node: "test", windowSeconds: 120, onQuit() {}, onPauseToggle() {}, onReset() {} });
   ui.view = "round";
   const originalWrite = process.stdout.write;
-  let rendered = "";
-  process.stdout.write = (chunk) => { rendered = stripAnsi(String(chunk)); return true; };
+  const screen = new TerminalScreen();
+  process.stdout.write = (chunk, ...args) => {
+    if (typeof chunk !== "string") return originalWrite.call(process.stdout, chunk, ...args);
+    screen.write(chunk);
+    return true;
+  };
   const render = (schedule, head, slot, witness, propsHead = head, propsSlot = slot) => ui.render(
     {
       type: "block", block: { ...blockRecord(head), witness }, headBlock: propsHead, lag: propsHead - head,
@@ -1042,19 +1129,19 @@ test("TerminalUi previews the announced round and promotes it without waiting fo
   try {
     render(oldSchedule, 2, 5, "carol");
     assert.deepEqual(preview(), [[3, "alice"], [4, "erin"], [5, "frank"]]);
-    assert.ok(rendered.includes("Current round 1-3 (2/3) | > current"));
-    assert.match(rendered, /^> 2\s/m);
+    assert.ok((await screen.text()).includes("Current round 1-3 (2/3) | > current"));
+    assert.match(await screen.text(), /^> 2\s/m);
     ui.revealedFutureRows = ui.futureRevealTarget;
     ui.draw();
-    assert.match(rendered, /^> 3\s/m, "unproduced blocks in the current round are marked");
-    assert.match(rendered, /^  4\s/m, "next-round predictions are not marked as current");
+    assert.match(await screen.text(), /^> 3\s/m, "unproduced blocks in the current round are marked");
+    assert.match(await screen.text(), /^  4\s/m, "next-round predictions are not marked as current");
     render(newSchedule, 3, 6, "alice");
-    assert.ok(rendered.includes("Current round 1-3 (3/3) | > current"));
+    assert.ok((await screen.text()).includes("Current round 1-3 (3/3) | > current"));
     assert.equal(ui.displayedRoundSchedule, oldSchedule, "boundary block uses the old order");
     assert.deepEqual(preview(), [[4, "erin"], [5, "frank"], [6, "dan"]]);
     render(newSchedule, 4, 7, "erin", 5, 8);
-    assert.ok(rendered.includes("Current round 4-6 (1/3) | > current"), "round follows displayed blocks during follower lag");
-    assert.match(rendered, /^> 4\s/m);
+    assert.ok((await screen.text()).includes("Current round 4-6 (1/3) | > current"), "round follows displayed blocks during follower lag");
+    assert.match(await screen.text(), /^> 4\s/m);
     assert.equal(ui.displayedRoundSchedule, newSchedule, "announced order needs no extra matching blocks");
     assert.deepEqual(preview(), [[5, "frank"], [6, "dan"]]);
     render(oldSchedule, 4, 7, "erin");
@@ -1063,6 +1150,7 @@ test("TerminalUi previews the announced round and promotes it without waiting fo
   } finally {
     ui.stop();
     process.stdout.write = originalWrite;
+    screen.dispose();
   }
 });
 
@@ -1305,10 +1393,14 @@ async function waitFor(predicate, timeoutMs = 1000) {
   }
 }
 
-test("terminal controls filter witnesses, inspect blocks, and preserve event history", () => {
+test("terminal controls filter witnesses, inspect blocks, and preserve event history", async () => {
   const originalWrite = process.stdout.write;
-  let output = "";
-  process.stdout.write = (chunk) => { output = stripAnsi(String(chunk)); return true; };
+  const screen = new TerminalScreen();
+  process.stdout.write = (chunk, ...args) => {
+    if (typeof chunk !== "string") return originalWrite.call(process.stdout, chunk, ...args);
+    screen.write(chunk);
+    return true;
+  };
   let node = "https://one.test";
   let quit = false;
   const ui = new TerminalUi({ node: () => node, windowSeconds: 120, noColor: true, onQuit() { quit = true; }, onPauseToggle() {}, onReset() {} });
@@ -1321,32 +1413,32 @@ test("terminal controls filter witnesses, inspect blocks, and preserve event his
   const event = { type: "block", block: blocks[0], headBlock: 11, lag: 0, dynamicGlobalProperties: { head_block_number: 11, time: now.toISOString() }, witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] };
   try {
     ui.render(event, snapshot);
-    assert.match(output, /LIVE \| block/);
+    assert.match(await screen.text(), /LIVE \| block/);
     ui.onKey("/"); ui.onKey("alice"); ui.onKey("\r");
-    assert.match(output, /Witness filter: alice/);
+    assert.match(await screen.text(), /Witness filter: alice/);
     assert.deepEqual(ui.tableBlockNumbers, [10]);
     ui.onKey("\u001b[B"); ui.onKey("\r");
-    assert.match(output, /BLOCK 10 \(Esc returns/);
-    assert.match(output, /vote: 2/);
-    assert.match(output, /transaction-abc/);
+    assert.match(await screen.text(), /BLOCK 10 \(Esc returns/);
+    assert.match(await screen.text(), /vote: 2/);
+    assert.match(await screen.text(), /transaction-abc/);
     ui.onKey("\u001b"); ui.onKey("\u001b");
     assert.deepEqual(ui.tableBlockNumbers, [11, 10]);
-    ui.onKey("?"); assert.match(output, /HELP \/ LEGENDS/); ui.onKey("\u001b");
+    ui.onKey("?"); assert.match(await screen.text(), /HELP \/ LEGENDS/); ui.onKey("\u001b");
     ui.lastDataReceivedAt = Date.now() - 16000;
     ui.draw();
-    assert.match(output, /STALE \| block/);
-    assert.match(output, /cached blk\/s/);
+    assert.match(await screen.text(), /STALE \| block/);
+    assert.match(await screen.text(), /cached blk\/s/);
     ui.render({ ...event, type: "retry", message: "offline", retryInMs: 1000 }, snapshot);
-    assert.match(output, /RECONNECTING/);
+    assert.match(await screen.text(), /RECONNECTING/);
     node = "https://two.test";
     ui.render({ ...event, missedBlocks: [{ detectedAtBlock: 11, witness: "carol", detectedAt: now.toISOString() }] }, snapshot);
-    assert.match(output, /LIVE \| block/);
+    assert.match(await screen.text(), /LIVE \| block/);
     ui.onKey("e");
-    assert.match(output, /Missed block 11: carol/);
-    assert.match(output, /Node switched:/);
-    assert.match(output, /RPC interrupted: offline/);
+    assert.match(await screen.text(), /Missed block 11: carol/);
+    assert.match(await screen.text(), /Node switched:/);
+    assert.match(await screen.text(), /RPC interrupted: offline/);
     ui.onKey("q"); assert.equal(quit, true);
-  } finally { ui.stop(); process.stdout.write = originalWrite; }
+  } finally { ui.stop(); process.stdout.write = originalWrite; screen.dispose(); }
 });
 
 test("ASCII/NO_COLOR views fit small terminals and keep status distinctions", () => {
