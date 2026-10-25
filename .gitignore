@@ -1,3 +1,7 @@
 node_modules/
 .DS_Store
 npm-debug.log*
+coverage.lcov
+
+# Local replay output and raw measurements.
+/benchmarks/

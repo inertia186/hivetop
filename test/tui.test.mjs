@@ -684,6 +684,8 @@ test("TransactionStatusMonitor groups work without batching while the visible wi
 });
 
 test("TransactionStatusMonitor uses batch only after retained blocks fall behind the visible window", { timeout: 1000 }, async (context) => {
+  // Keep the first sync from spending another 1 ms request slot before eviction.
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const batches = [];
   let batchReady;
   const batched = new Promise((resolve) => { batchReady = resolve; });
@@ -723,12 +725,14 @@ test("TransactionStatusMonitor uses batch only after retained blocks fall behind
     () => {},
   );
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
+  context.mock.timers.tick(1);
   await batched;
 
   assert.deepEqual(batches[0], ["vote-2", "vote-3"]);
 });
 
-test("TransactionStatusMonitor falls back to single requests when escalated batch is unsupported", async () => {
+test("TransactionStatusMonitor falls back to single requests when escalated batch is unsupported", async (context) => {
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const singles = [];
   const monitor = new TransactionStatusMonitor(
     {
@@ -748,6 +752,8 @@ test("TransactionStatusMonitor falls back to single requests when escalated batc
     8,
   );
 
+  context.after(() => monitor.stop());
+
   monitor.sync(
     {
       blocks: [
@@ -761,14 +767,15 @@ test("TransactionStatusMonitor falls back to single requests when escalated batc
     () => {},
   );
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
-  await waitFor(() => singles.length === 3 && monitor.diagnostic());
+  context.mock.timers.tick(1);
+  await new Promise(setImmediate);
 
   assert.deepEqual(singles, ["tx-1", "tx-2", "tx-3"]);
   assert.match(monitor.diagnostic(), /batch unsupported/);
-  monitor.stop();
 });
 
-test("TransactionStatusMonitor stops batching after retained offscreen work completes", async () => {
+test("TransactionStatusMonitor stops batching after retained offscreen work completes", async (context) => {
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const monitor = new TransactionStatusMonitor(
     {
       async findTransaction(transactionId) {
@@ -789,6 +796,8 @@ test("TransactionStatusMonitor stops batching after retained offscreen work comp
     8,
   );
 
+  context.after(() => monitor.stop());
+
   monitor.sync(
     {
       blocks: [
@@ -804,10 +813,10 @@ test("TransactionStatusMonitor stops batching after retained offscreen work comp
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
 
   assert.match(monitor.budgetLine(), /batch\/s/);
-  await sleep(5);
+  context.mock.timers.tick(1);
+  await new Promise(setImmediate);
 
   assert.match(monitor.budgetLine(), /request\/s/);
-  monitor.stop();
 });
 
 test("TransactionStatusMonitor keeps evicted pending blocks visible", async () => {
@@ -1495,4 +1504,27 @@ test("transaction RPC timeouts retry and stopping the monitor cancels requests",
     assert.equal(monitor.diagnostic(), undefined);
   } finally { monitor.stop(); }
   assert.equal(signal.aborted, true);
+});
+
+test("status retention trims a large unordered window by block number and preserves replacements", () => {
+  const monitor = new TransactionStatusMonitor({ async findTransaction() { throw new Error('unexpected request'); } }, 0);
+  const history = Array.from({ length: 1201 }, (_, index) => blockRecord(1000 + index, [{ id: `tx-${1000 + index}` }]));
+  const unordered = [...history.filter(b => b.number % 2), ...history.filter(b => !(b.number % 2))];
+  const numbers = unordered.map(b => b.number);
+  try {
+    monitor.sync({ blocks: unordered }, () => {});
+    assert.deepEqual(monitor.displayBlocks().map(b => b.number), Array.from({ length: 300 }, (_, index) => 2200 - index));
+    assert.deepEqual(unordered.map(b => b.number), numbers, 'trimming must not discard metrics rows or reorder their snapshot');
+    assert.equal(monitor.queue.length, 300);
+    const replacement = { ...history.at(-1), sizeBytes: 7777 };
+    const next = blockRecord(2201, [{ id: 'tx-2201' }]);
+    monitor.sync({ blocks: [next, replacement, ...unordered.filter(b => b.number !== 2200)] }, () => {});
+    const retained = monitor.displayBlocks();
+    assert.equal(retained.length, 300);
+    assert.deepEqual(retained.map(b => b.number), Array.from({ length: 300 }, (_, index) => 2201 - index));
+    assert.equal(retained[1], replacement);
+    replacement.sizeBytes = 8888;
+    assert.equal(monitor.displayBlocks()[1].sizeBytes, 8888, 'later size updates must remain visible');
+    assert.ok(monitor.queue.every(tx => tx.blockNumber >= 1902));
+  } finally { monitor.stop(); }
 });

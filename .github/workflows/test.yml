@@ -17,6 +17,6 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
-      - run: npm test
+      - run: npm run test:coverage
       - name: Verify checked-in runtime
         run: git diff --exit-code -- dist

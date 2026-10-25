@@ -220,7 +220,7 @@ test("HiveRpcClient throws HiveRpcError on RPC errors", async () => {
   await assert.rejects(() => client.getBlock(123), HiveRpcError);
 });
 
-test("FailoverHiveRpcClient rotates to the next endpoint after a failed call", async () => {
+test("FailoverHiveRpcClient keeps the current endpoint after a successful failover", async () => {
   const calls = [];
   const client = new FailoverHiveRpcClient(["https://first.test", "https://second.test"], (endpoint) => ({
     endpoint,
@@ -236,20 +236,7 @@ test("FailoverHiveRpcClient rotates to the next endpoint after a failed call", a
   assert.equal(props.head_block_number, 10);
   assert.deepEqual(calls, ["https://first.test", "https://second.test"]);
   assert.equal(client.endpoint, "https://second.test");
-});
 
-test("FailoverHiveRpcClient keeps the current endpoint after a successful failover", async () => {
-  const calls = [];
-  const client = new FailoverHiveRpcClient(["https://first.test", "https://second.test"], (endpoint) => ({
-    endpoint,
-    async getDynamicGlobalProperties() {
-      calls.push(endpoint);
-      if (endpoint === "https://first.test") throw new Error("offline");
-      return { head_block_number: 10, time: "2026-06-16T20:00:00" };
-    },
-  }));
-
-  await client.getDynamicGlobalProperties();
   await client.getDynamicGlobalProperties();
 
   assert.deepEqual(calls, ["https://first.test", "https://second.test", "https://second.test"]);
@@ -329,3 +316,78 @@ test("RPC batch requests time out and caller cancellation does not fail over", a
   await assert.rejects(client.getBlock(1, abort.signal), { name: "AbortError" });
   assert.equal(calls, 1);
 });
+
+test("schedule refreshes are single-flight and discard cancelled or old-endpoint responses", async () => {
+  const { WitnessScheduleReader } = await import('../dist/rpc.js');
+  const reader = new WitnessScheduleReader();
+  const requests = [];
+  const client = endpoint => ({ endpoint, getWitnessSchedule(signal) {
+    return new Promise(resolve => requests.push({ endpoint, signal, resolve }));
+  } });
+  const first = client('https://first.test'), second = client('https://second.test');
+  reader.refresh(first);
+  const old = reader.pending;
+  reader.refresh(first);
+  assert.equal(requests.length, 1);
+  reader.refresh(second, undefined, false);
+  assert.equal(requests.length, 2, 'an endpoint change requires fresh data even within the refresh interval');
+  assert.equal(requests[0].signal.aborted, true);
+  const current = { current_shuffled_witnesses: ['new'] };
+  requests[1].resolve(current);
+  await reader.pending;
+  requests[0].resolve({ current_shuffled_witnesses: ['old'] });
+  await old;
+  assert.equal(reader.schedule, current);
+  const caller = new AbortController();
+  reader.refresh(second, caller.signal);
+  const pending = reader.pending;
+  caller.abort();
+  requests[2].resolve({ current_shuffled_witnesses: ['cancelled'] });
+  await pending;
+  assert.equal(reader.schedule, current);
+  reader.stop();
+});
+
+test("failed schedule refreshes keep cached data and back off for thirty seconds", async context => {
+  const { WitnessScheduleReader } = await import('../dist/rpc.js');
+  context.mock.timers.enable({ apis: ['Date'] });
+  const reader = new WitnessScheduleReader();
+  let calls = 0;
+  const schedule = { current_shuffled_witnesses: ['alice'] };
+  const client = { endpoint: 'https://example.test', async getWitnessSchedule() {
+    if (++calls === 2) throw new Error('schedule unavailable');
+    return schedule;
+  } };
+  reader.refresh(client); await reader.pending;
+  reader.refresh(client); await reader.pending;
+  assert.equal(reader.schedule, schedule);
+  assert.match(reader.error.message, /schedule unavailable/);
+  context.mock.timers.tick(29999);
+  reader.refresh(client);
+  assert.equal(calls, 2);
+  context.mock.timers.tick(1);
+  reader.refresh(client); await reader.pending;
+  assert.equal(calls, 3);
+  assert.equal(reader.error, undefined);
+  reader.stop();
+});
+
+for (const first of ['schedule', 'block']) {
+  test(`block context reuses the ${first} request slot before fetching virtual operations`, async () => {
+    const { readBlockWithSchedule } = await import('../dist/rpc.js');
+    let finishBlock, finishSchedule, ops = 0;
+    const block = new Promise(resolve => { finishBlock = resolve; });
+    const schedule = new Promise(resolve => { finishSchedule = resolve; });
+    const value = { witness: 'alice' };
+    const read = readBlockWithSchedule({
+      getBlock() { return block; },
+      async getVirtualOperationsInBlock() { ops++; return ['evidence']; },
+    }, 1, schedule);
+    assert.equal(ops, 0);
+    if (first === 'schedule') finishSchedule(); else finishBlock(value);
+    await new Promise(setImmediate);
+    assert.equal(ops, 1);
+    finishBlock(value); finishSchedule();
+    assert.deepEqual(await read, [value, ['evidence']]);
+  });
+}

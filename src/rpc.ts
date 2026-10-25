@@ -48,6 +48,57 @@ export interface StableEndpointHiveRpcReadable extends HiveRpcReadable {
   withStableEndpoint<T>(read: (client: HiveRpcReadable) => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 
+// A schedule request may outlive a block read, but never its endpoint or caller.
+export class WitnessScheduleReader {
+  schedule: WitnessSchedule | undefined;
+  fetchedAt = 0;
+  error: { message: string; at: number } | undefined;
+  pending: Promise<void> | undefined;
+  private endpoint: string | undefined;
+  private controller: AbortController | undefined;
+
+  refresh(client: HiveRpcReadable, signal?: AbortSignal, needed = true, onSchedule?: (schedule: WitnessSchedule) => void): void {
+    if (client.endpoint !== this.endpoint) {
+      this.stop();
+      this.endpoint = client.endpoint;
+      this.schedule = undefined;
+      this.error = undefined;
+      this.fetchedAt = 0;
+      needed = true;
+    }
+    if (signal?.aborted || this.pending || !needed || (this.error && Date.now() - this.error.at < 30_000)) return;
+    const controller = new AbortController();
+    this.controller = controller;
+    const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const startedAt = Date.now();
+    const request = client.getWitnessSchedule(requestSignal, true).then(schedule => {
+      if (requestSignal.aborted) return;
+      this.schedule = schedule;
+      this.fetchedAt = startedAt;
+      this.error = undefined;
+      onSchedule?.(schedule);
+    }, error => {
+      if (!requestSignal.aborted) this.error = { message: error instanceof Error ? error.message : String(error), at: Date.now() };
+    }).finally(() => {
+      if (this.pending === request) this.pending = undefined;
+    });
+    this.pending = request;
+  }
+
+  stop(): void {
+    this.controller?.abort();
+    this.controller = undefined;
+    this.pending = undefined;
+  }
+}
+
+export async function readBlockWithSchedule(client: HiveRpcReadable, blockNumber: number, schedule: Promise<void> | undefined, signal?: AbortSignal): Promise<[HiveBlock | null, AppliedOperation[]]> {
+  const block = client.getBlock(blockNumber, signal);
+  // Reuse the schedule's slot or the completed block's slot before starting ops.
+  if (schedule) await Promise.race([block, schedule]);
+  return Promise.all([block, client.getVirtualOperationsInBlock(blockNumber, signal)]);
+}
+
 export class HiveRpcError extends Error {
   constructor(
     message: string,
