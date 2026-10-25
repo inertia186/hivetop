@@ -675,11 +675,11 @@ export class TransactionStatusMonitor {
         this.behindVisibleWindow = [...this.retainedBlocks.keys()].some((blockNumber) => !this.visibleBlockNumbers.has(blockNumber));
     }
     trimRetainedBlocks() {
-        while (this.retainedBlocks.size > this.maxRetainedBlocks) {
-            const oldest = [...this.retainedBlocks.keys()].sort((a, b) => a - b)[0];
-            if (oldest === undefined)
-                return;
-            this.retainedBlocks.delete(oldest);
+        if (this.retainedBlocks.size > this.maxRetainedBlocks) {
+            const excess = Math.ceil(this.retainedBlocks.size - this.maxRetainedBlocks);
+            const oldest = [...this.retainedBlocks.keys()].sort((a, b) => a - b).slice(0, excess);
+            for (const number of oldest)
+                this.retainedBlocks.delete(number);
         }
     }
     async checkBatch(batch) {
