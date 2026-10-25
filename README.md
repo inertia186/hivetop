@@ -94,9 +94,12 @@ block window. While catching up, the block age refers to the followed block.
 
 RC stats, hardfork info, and witness ranks refresh independently of block
 tracking. Failed metadata requests retain last-known values, display an
-unavailable/stale notice, and retry after 30 seconds. The schedule is fetched
-with the block context; if unavailable, blocks still advance and the last-known
-schedule remains subject to its normal prediction expiry.
+unavailable/stale notice, and retry after 30 seconds. Schedule refreshes run in
+the background on the block's pinned endpoint.
+Slow or unavailable schedules leave block tracking running, with last-known
+predictions subject to their normal expiry. A node change cancels the old
+refresh and fetches fresh schedule data. JSON diagnostics also continue through
+schedule failures and include `schedule_error` while unavailable.
 
 The dashboard uses the terminal's alternate screen and restores the cursor and
 normal input mode when you quit, press Ctrl-C, or send SIGTERM. Redirected output
@@ -189,11 +192,39 @@ in new shells if needed. `npm start` also runs the app directly from the checkou
 
 ```bash
 npm test
+npm run test:coverage
 npm run build
 ```
 
-GitHub Actions runs the tests on Node 24 and verifies that rebuilding does not
-change the checked-in `dist/` files. Run `npm ci` after cloning to install the
+`npm run test:coverage` rebuilds and runs the same tests with Node's built-in
+coverage, prints line/branch/function coverage for `dist/**/*.js`, and writes
+`coverage.lcov` (ignored by Git). Coverage refers to the generated JavaScript
+that the tests execute. See [HILLS.md](HILLS.md) for the baseline and test-reduction
+rules.
+
+To measure coverage overlap between individual tests:
+
+```bash
+npm run coverage:overlap -- --output /tmp/hivetop-overlap.json
+```
+
+This runs each case separately, subtracts file-load coverage, ranks cases by
+unique coverage, and checks the full suite with five leading candidates omitted
+one at a time. The JSON report includes the tests covering each candidate's
+paths, source hashes, and validation results. Use a new output path for each
+measurement. `npm run coverage:overlap -- --verify` runs the collector's small
+self-check fixtures. These measurements run locally; CI runs the normal coverage
+suite.
+
+Long-window replay measurements use `scripts/window-baseline.mjs` with Node
+24.16.0 and `--expose-gc`. They compare a preserved runtime with the checkout
+across all views and check exact output/state equivalence and bounded memory.
+See [HILLS.md](HILLS.md) for commands, baseline reconstruction, accepted results,
+and the separate default-window controls.
+
+GitHub Actions runs the tests with coverage on Node 24 and verifies that
+rebuilding does not change the checked-in `dist/` files. Run `npm ci` after cloning
+to install the
 development tools. Runtime dependencies are provided by Node itself.
 
 ### Renderer A/B experiment
