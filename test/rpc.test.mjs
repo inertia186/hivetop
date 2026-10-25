@@ -220,7 +220,7 @@ test("HiveRpcClient throws HiveRpcError on RPC errors", async () => {
   await assert.rejects(() => client.getBlock(123), HiveRpcError);
 });
 
-test("FailoverHiveRpcClient rotates to the next endpoint after a failed call", async () => {
+test("FailoverHiveRpcClient keeps the current endpoint after a successful failover", async () => {
   const calls = [];
   const client = new FailoverHiveRpcClient(["https://first.test", "https://second.test"], (endpoint) => ({
     endpoint,
@@ -236,20 +236,7 @@ test("FailoverHiveRpcClient rotates to the next endpoint after a failed call", a
   assert.equal(props.head_block_number, 10);
   assert.deepEqual(calls, ["https://first.test", "https://second.test"]);
   assert.equal(client.endpoint, "https://second.test");
-});
 
-test("FailoverHiveRpcClient keeps the current endpoint after a successful failover", async () => {
-  const calls = [];
-  const client = new FailoverHiveRpcClient(["https://first.test", "https://second.test"], (endpoint) => ({
-    endpoint,
-    async getDynamicGlobalProperties() {
-      calls.push(endpoint);
-      if (endpoint === "https://first.test") throw new Error("offline");
-      return { head_block_number: 10, time: "2026-06-16T20:00:00" };
-    },
-  }));
-
-  await client.getDynamicGlobalProperties();
   await client.getDynamicGlobalProperties();
 
   assert.deepEqual(calls, ["https://first.test", "https://second.test", "https://second.test"]);

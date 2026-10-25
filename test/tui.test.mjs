@@ -684,6 +684,8 @@ test("TransactionStatusMonitor groups work without batching while the visible wi
 });
 
 test("TransactionStatusMonitor uses batch only after retained blocks fall behind the visible window", { timeout: 1000 }, async (context) => {
+  // Keep the first sync from spending another 1 ms request slot before eviction.
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const batches = [];
   let batchReady;
   const batched = new Promise((resolve) => { batchReady = resolve; });
@@ -723,12 +725,14 @@ test("TransactionStatusMonitor uses batch only after retained blocks fall behind
     () => {},
   );
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
+  context.mock.timers.tick(1);
   await batched;
 
   assert.deepEqual(batches[0], ["vote-2", "vote-3"]);
 });
 
-test("TransactionStatusMonitor falls back to single requests when escalated batch is unsupported", async () => {
+test("TransactionStatusMonitor falls back to single requests when escalated batch is unsupported", async (context) => {
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const singles = [];
   const monitor = new TransactionStatusMonitor(
     {
@@ -748,6 +752,8 @@ test("TransactionStatusMonitor falls back to single requests when escalated batc
     8,
   );
 
+  context.after(() => monitor.stop());
+
   monitor.sync(
     {
       blocks: [
@@ -761,14 +767,15 @@ test("TransactionStatusMonitor falls back to single requests when escalated batc
     () => {},
   );
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
-  await waitFor(() => singles.length === 3 && monitor.diagnostic());
+  context.mock.timers.tick(1);
+  await new Promise(setImmediate);
 
   assert.deepEqual(singles, ["tx-1", "tx-2", "tx-3"]);
   assert.match(monitor.diagnostic(), /batch unsupported/);
-  monitor.stop();
 });
 
-test("TransactionStatusMonitor stops batching after retained offscreen work completes", async () => {
+test("TransactionStatusMonitor stops batching after retained offscreen work completes", async (context) => {
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
   const monitor = new TransactionStatusMonitor(
     {
       async findTransaction(transactionId) {
@@ -789,6 +796,8 @@ test("TransactionStatusMonitor stops batching after retained offscreen work comp
     8,
   );
 
+  context.after(() => monitor.stop());
+
   monitor.sync(
     {
       blocks: [
@@ -804,10 +813,10 @@ test("TransactionStatusMonitor stops batching after retained offscreen work comp
   monitor.sync({ blocks: [blockRecord(102, [])] }, () => {});
 
   assert.match(monitor.budgetLine(), /batch\/s/);
-  await sleep(5);
+  context.mock.timers.tick(1);
+  await new Promise(setImmediate);
 
   assert.match(monitor.budgetLine(), /request\/s/);
-  monitor.stop();
 });
 
 test("TransactionStatusMonitor keeps evicted pending blocks visible", async () => {
