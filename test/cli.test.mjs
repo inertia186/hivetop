@@ -118,3 +118,57 @@ test("JSON diagnostics retain the accepted schedule through a round boundary", a
   assert.deepEqual(logs.map((entry) => entry.future_block), [4, 4, 7]);
   assert.deepEqual(logs.map((entry) => entry.future_scheduled), ["erin", "erin", "hana"]);
 });
+
+test("JSON diagnostics advance with an unknown schedule and cancel refreshes at the limit", async () => {
+  let signal, calls = 0;
+  const client = {
+    endpoint: 'https://example.test',
+    async getDynamicGlobalProperties() { return { head_block_number: 11, time: '2026-06-16T20:00:00' }; },
+    async getBlock() { return { timestamp: '2026-06-16T20:00:00', witness: 'alice', transactions: [] }; },
+    async getVirtualOperationsInBlock() { return []; },
+    getWitnessSchedule(active) {
+      calls++; signal = active;
+      return new Promise((resolve, reject) => active.addEventListener('abort', () => reject(active.reason), { once: true }));
+    },
+  };
+  const logs = [], originalLog = console.log;
+  console.log = line => logs.push(JSON.parse(line));
+  try { await runFollowLog(client, { start: 10, pollMs: 1000, follow: true, limit: 2 }, new AbortController().signal); }
+  finally { console.log = originalLog; }
+  assert.deepEqual(logs.map(row => row.block), [10, 11]);
+  assert.ok(logs.every(row => row.status === '?' && row.scheduled === undefined));
+  assert.equal(calls, 1);
+  assert.equal(signal.aborted, true);
+});
+
+test("diagnostic idle polling wakes when the pending schedule completes", async context => {
+  context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  let head = 10, finishSchedule;
+  const schedule = { current_shuffled_witnesses: ['alice'], next_shuffle_block_num: 11 };
+  let first = true;
+  const client = {
+    endpoint: 'https://example.test',
+    async getDynamicGlobalProperties() { return { head_block_number: head, time: '2026-06-16T20:00:00' }; },
+    async getBlock() { return { timestamp: '2026-06-16T20:00:00', witness: 'alice', transactions: [] }; },
+    async getVirtualOperationsInBlock() { return []; },
+    getWitnessSchedule() {
+      if (!first) return Promise.resolve(schedule);
+      first = false;
+      return new Promise(resolve => { finishSchedule = resolve; });
+    },
+  };
+  const originalLog = console.log, logs = [];
+  console.log = line => logs.push(JSON.parse(line));
+  const abort = new AbortController();
+  const running = runFollowLog(client, { start: 10, pollMs: 1000, follow: true, limit: 2 }, abort.signal);
+  try {
+    await new Promise(setImmediate);
+    assert.equal(logs.length, 1);
+    context.mock.timers.tick(100);
+    head = 11;
+    finishSchedule(schedule);
+    await new Promise(setImmediate);
+    assert.deepEqual(logs.map(row => row.block), [10, 11]);
+    await running;
+  } finally { abort.abort(); await running; console.log = originalLog; }
+});

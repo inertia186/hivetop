@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { BlockFollower, missedBlocksFromVirtualOperations, sleep, toBlockRecord } from "./follower.js";
 import { MetricsStore } from "./metrics.js";
-import { FailoverHiveRpcClient, HiveRpcClient, withStableEndpoint } from "./rpc.js";
+import { FailoverHiveRpcClient, HiveRpcClient, readBlockWithSchedule, WitnessScheduleReader, withStableEndpoint } from "./rpc.js";
 import { formatRoundProducedStatus } from "./tui.js";
 import { WitnessScheduleTracker, scheduledRoundRows, roundRowsOptions } from "./schedule.js";
 import { TerminalUi } from "./tui.js";
@@ -74,97 +74,104 @@ export async function runFollowLog(client, options, signal) {
     let gapRetries = 0;
     const maxGapRetries = options.maxGapRetries ?? DEFAULT_FOLLOW_GAP_RETRIES;
     const gapRetryMs = options.gapRetryMs ?? Math.max(1000, options.pollMs);
-    while (!signal.aborted) {
-        const read = await withStableEndpoint(client, async (endpointClient) => {
-            const [props, schedule] = await Promise.all([
-                endpointClient.getDynamicGlobalProperties(signal),
-                endpointClient.getWitnessSchedule(signal, true),
-            ]);
-            const effectiveNextBlock = nextBlock ?? props.head_block_number;
-            if (effectiveNextBlock > props.head_block_number)
-                return { props, schedule, nextBlock: effectiveNextBlock };
-            const [block, virtualOperations] = await Promise.all([
-                endpointClient.getBlock(effectiveNextBlock, signal),
-                endpointClient.getVirtualOperationsInBlock(effectiveNextBlock, signal),
-            ]);
-            return { props, schedule, nextBlock: effectiveNextBlock, block, virtualOperations };
-        }, signal);
-        const { props, schedule } = read;
-        nextBlock = read.nextBlock;
-        if (nextBlock > props.head_block_number) {
-            await sleep(options.pollMs, signal);
-            continue;
-        }
-        const { block, virtualOperations } = read;
-        if (!block) {
-            gapRetries += 1;
-            const terminal = gapRetries > maxGapRetries;
-            console.log(JSON.stringify({
-                type: "gap",
-                block: nextBlock,
-                head: props.head_block_number,
-                endpoint: client.endpoint,
-                retry: gapRetries,
-                terminal,
-            }));
-            if (!terminal) {
-                await sleep(gapRetryMs, signal);
+    const scheduleReader = new WitnessScheduleReader();
+    try {
+        while (!signal.aborted) {
+            const read = await withStableEndpoint(client, async (endpointClient) => {
+                scheduleReader.refresh(endpointClient, signal);
+                const props = await endpointClient.getDynamicGlobalProperties(signal);
+                const effectiveNextBlock = nextBlock ?? props.head_block_number;
+                if (effectiveNextBlock > props.head_block_number)
+                    return { props, schedule: scheduleReader.schedule ?? {}, nextBlock: effectiveNextBlock };
+                const [block, virtualOperations] = await readBlockWithSchedule(endpointClient, effectiveNextBlock, scheduleReader.pending, signal);
+                return { props, schedule: scheduleReader.schedule ?? {}, nextBlock: effectiveNextBlock, block, virtualOperations };
+            }, signal);
+            if (signal.aborted)
+                break;
+            const { props, schedule } = read;
+            nextBlock = read.nextBlock;
+            if (nextBlock > props.head_block_number) {
+                const wake = new AbortController();
+                if (scheduleReader.pending)
+                    void scheduleReader.pending.then(() => wake.abort());
+                await sleep(options.pollMs, AbortSignal.any([signal, wake.signal]));
                 continue;
             }
+            const { block, virtualOperations } = read;
+            if (!block) {
+                gapRetries += 1;
+                const terminal = gapRetries > maxGapRetries;
+                console.log(JSON.stringify({
+                    type: "gap",
+                    block: nextBlock,
+                    head: props.head_block_number,
+                    endpoint: client.endpoint,
+                    retry: gapRetries,
+                    terminal,
+                }));
+                if (!terminal) {
+                    await sleep(gapRetryMs, signal);
+                    continue;
+                }
+                emittedRecords += 1;
+                if (options.limit !== undefined && emittedRecords >= options.limit)
+                    break;
+                nextBlock += 1;
+                gapRetries = 0;
+                continue;
+            }
+            gapRetries = 0;
+            const record = toBlockRecord(nextBlock, block, virtualOperations.length);
+            blocks.unshift(record);
+            blocks.splice(120);
+            const newMisses = missedBlocksFromVirtualOperations(nextBlock, block.timestamp, virtualOperations);
+            if (newMisses.length > 0)
+                missedBlocks = [...newMisses, ...missedBlocks].slice(0, 24);
+            scheduleTracker.update(props, schedule, blocks, missedBlocks);
+            const displayedSchedule = scheduleTracker.schedule ?? schedule;
+            const scheduleSignature = witnessScheduleSignature(displayedSchedule);
+            const scheduleChanged = scheduleSignature !== lastScheduleSignature;
+            lastScheduleSignature = scheduleSignature;
+            const rows = scheduledRoundRows(nextBlock, displayedSchedule, blocks, missedBlocks, roundRowsOptions(props, blocks, scheduleTracker.minBlockNumber));
+            const row = rows.find((candidate) => candidate.blockNumber === nextBlock);
+            const futureBoundary = Math.max(nextBlock, displayedSchedule.next_shuffle_block_num ?? nextBlock);
+            const futureRow = rows.find((candidate) => candidate.blockNumber > futureBoundary);
+            console.log(JSON.stringify({
+                type: "block",
+                endpoint: client.endpoint,
+                block: nextBlock,
+                head: props.head_block_number,
+                lag: Math.max(0, props.head_block_number - nextBlock),
+                block_time: block.timestamp,
+                dgpo_time: props.time,
+                produced: block.witness,
+                scheduled: row?.settling ? undefined : row?.scheduledWitness,
+                status: row ? formatRoundProducedStatus(row, nextBlock, 0, missedBlocks) : "?",
+                current_aslot: props.current_aslot,
+                future_block: futureRow?.blockNumber,
+                future_scheduled: futureRow?.settling ? undefined : futureRow?.scheduledWitness,
+                future_status: futureRow ? "-" : undefined,
+                settling: Boolean(row?.settling),
+                schedule_changed: scheduleChanged,
+                schedule_error: scheduleReader.error?.message,
+                next_shuffle_block_num: displayedSchedule.next_shuffle_block_num,
+                schedule_index: displayedSchedule.current_shuffled_witnesses?.indexOf(block.witness) ?? -1,
+                future_schedule_index: displayedSchedule.future_shuffled_witnesses?.indexOf(block.witness) ?? -1,
+                schedule_sig: shortScheduleSignature(displayedSchedule),
+                future_schedule_sig: shortWitnessListSignature(displayedSchedule.future_shuffled_witnesses),
+                reported_schedule_sig: shortScheduleSignature(schedule),
+                reported_next_shuffle_block_num: schedule.next_shuffle_block_num,
+                future_changes: displayedSchedule.future_changes,
+                missed: newMisses.map((miss) => miss.witness),
+            }));
             emittedRecords += 1;
             if (options.limit !== undefined && emittedRecords >= options.limit)
                 break;
             nextBlock += 1;
-            gapRetries = 0;
-            continue;
         }
-        gapRetries = 0;
-        const record = toBlockRecord(nextBlock, block, virtualOperations.length);
-        blocks.unshift(record);
-        blocks.splice(120);
-        const newMisses = missedBlocksFromVirtualOperations(nextBlock, block.timestamp, virtualOperations);
-        if (newMisses.length > 0)
-            missedBlocks = [...newMisses, ...missedBlocks].slice(0, 24);
-        scheduleTracker.update(props, schedule, blocks, missedBlocks);
-        const displayedSchedule = scheduleTracker.schedule ?? schedule;
-        const scheduleSignature = witnessScheduleSignature(displayedSchedule);
-        const scheduleChanged = scheduleSignature !== lastScheduleSignature;
-        lastScheduleSignature = scheduleSignature;
-        const rows = scheduledRoundRows(nextBlock, displayedSchedule, blocks, missedBlocks, roundRowsOptions(props, blocks, scheduleTracker.minBlockNumber));
-        const row = rows.find((candidate) => candidate.blockNumber === nextBlock);
-        const futureBoundary = Math.max(nextBlock, displayedSchedule.next_shuffle_block_num ?? nextBlock);
-        const futureRow = rows.find((candidate) => candidate.blockNumber > futureBoundary);
-        console.log(JSON.stringify({
-            type: "block",
-            endpoint: client.endpoint,
-            block: nextBlock,
-            head: props.head_block_number,
-            lag: Math.max(0, props.head_block_number - nextBlock),
-            block_time: block.timestamp,
-            dgpo_time: props.time,
-            produced: block.witness,
-            scheduled: row?.settling ? undefined : row?.scheduledWitness,
-            status: row ? formatRoundProducedStatus(row, nextBlock, 0, missedBlocks) : "?",
-            current_aslot: props.current_aslot,
-            future_block: futureRow?.blockNumber,
-            future_scheduled: futureRow?.settling ? undefined : futureRow?.scheduledWitness,
-            future_status: futureRow ? "-" : undefined,
-            settling: Boolean(row?.settling),
-            schedule_changed: scheduleChanged,
-            next_shuffle_block_num: displayedSchedule.next_shuffle_block_num,
-            schedule_index: displayedSchedule.current_shuffled_witnesses?.indexOf(block.witness) ?? -1,
-            future_schedule_index: displayedSchedule.future_shuffled_witnesses?.indexOf(block.witness) ?? -1,
-            schedule_sig: shortScheduleSignature(displayedSchedule),
-            future_schedule_sig: shortWitnessListSignature(displayedSchedule.future_shuffled_witnesses),
-            reported_schedule_sig: shortScheduleSignature(schedule),
-            reported_next_shuffle_block_num: schedule.next_shuffle_block_num,
-            future_changes: displayedSchedule.future_changes,
-            missed: newMisses.map((miss) => miss.witness),
-        }));
-        emittedRecords += 1;
-        if (options.limit !== undefined && emittedRecords >= options.limit)
-            break;
-        nextBlock += 1;
+    }
+    finally {
+        scheduleReader.stop();
     }
 }
 function witnessScheduleSignature(schedule) {

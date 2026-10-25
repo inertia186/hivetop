@@ -17,7 +17,7 @@ import type {
   WitnessSchedule,
   WitnessVersions,
 } from "./types.js";
-import { withStableEndpoint, type HiveRpcReadable } from "./rpc.js";
+import { readBlockWithSchedule, WitnessScheduleReader, withStableEndpoint, type HiveRpcReadable } from "./rpc.js";
 
 export interface BlockFollowerOptions {
   startBlock?: number;
@@ -36,7 +36,7 @@ export class BlockFollower {
   private hardforkInfo: HardforkInfo | undefined;
   private hardforkInfoFetchedAt = 0;
   private witnessSchedule: WitnessSchedule | undefined;
-  private witnessScheduleFetchedAt = 0;
+  private readonly scheduleReader = new WitnessScheduleReader();
   private witnessScheduleRound: number | undefined;
   private witnessScheduleCurrentSignature: string | undefined;
   private witnessScheduleFutureSignature: string | undefined;
@@ -73,96 +73,100 @@ export class BlockFollower {
   async *follow(signal?: AbortSignal): AsyncGenerator<FollowerEvent> {
     let nextBlock = this.options.startBlock;
 
-    while (!signal?.aborted) {
-      if (this.paused) {
-        await sleep(this.options.pollMs, signal);
-        continue;
-      }
-
-      try {
-        const read = await withStableEndpoint(
-          this.client,
-          async (client) => {
-            const props = await client.getDynamicGlobalProperties(signal);
-            if (signal?.aborted) throw abortError();
-            this.refreshSidePanels(client, signal);
-            await this.refreshPanel("schedule", () => this.refreshWitnessSchedule(client, props, signal), signal);
-            const witnessSchedule = this.witnessSchedule;
-            const effectiveNextBlock = this.resetRequested ? props.head_block_number : (nextBlock ?? props.head_block_number);
-            if (effectiveNextBlock > props.head_block_number) {
-              return { props, witnessSchedule, nextBlock: effectiveNextBlock };
-            }
-            const [block, virtualOperations] = await Promise.all([
-              client.getBlock(effectiveNextBlock, signal),
-              client.getVirtualOperationsInBlock(effectiveNextBlock, signal),
-            ]);
-            return { props, witnessSchedule, nextBlock: effectiveNextBlock, block, virtualOperations };
-          },
-          signal,
-        );
-        if (signal?.aborted) break;
-
-        const { props, witnessSchedule } = read;
-        nextBlock = read.nextBlock;
-        if (this.resetRequested) this.resetRequested = false;
-
-        if (nextBlock > props.head_block_number) {
-          yield {
-            ...this.metadata(),
-            type: "status",
-            headBlock: props.head_block_number,
-            nextBlock,
-            lag: Math.max(0, props.head_block_number - nextBlock),
-            dynamicGlobalProperties: props,
-            witnessSchedule,
-          };
+    try {
+      while (!signal?.aborted) {
+        if (this.paused) {
           await sleep(this.options.pollMs, signal);
           continue;
         }
 
-        const { block, virtualOperations } = read;
+        try {
+          const read = await withStableEndpoint(
+            this.client,
+            async (client) => {
+              const props = await client.getDynamicGlobalProperties(signal);
+              if (signal?.aborted) throw abortError();
+              this.refreshSidePanels(client, signal);
+              this.refreshWitnessSchedule(client, props, signal);
+              const effectiveNextBlock = this.resetRequested ? props.head_block_number : (nextBlock ?? props.head_block_number);
+              if (effectiveNextBlock > props.head_block_number) {
+                return { props, witnessSchedule: this.scheduleReader.schedule, nextBlock: effectiveNextBlock };
+              }
+              const [block, virtualOperations] = await readBlockWithSchedule(client, effectiveNextBlock, this.scheduleReader.pending, signal);
+              return { props, witnessSchedule: this.scheduleReader.schedule, nextBlock: effectiveNextBlock, block, virtualOperations };
+            },
+            signal,
+          );
+          if (signal?.aborted) break;
 
-        if (!block) {
+          const { props, witnessSchedule } = read;
+          if (witnessSchedule && witnessSchedule !== this.witnessSchedule) {
+            this.updateWitnessScheduleDiagnostics(props, witnessSchedule);
+          }
+          this.witnessSchedule = witnessSchedule;
+          if (this.scheduleReader.error) this.panelErrors.schedule = this.scheduleReader.error;
+          else delete this.panelErrors.schedule;
+          nextBlock = read.nextBlock;
+          if (this.resetRequested) this.resetRequested = false;
+
+          if (nextBlock > props.head_block_number) {
+            yield {
+              ...this.metadata(),
+              type: "status",
+              headBlock: props.head_block_number,
+              nextBlock,
+              lag: Math.max(0, props.head_block_number - nextBlock),
+              dynamicGlobalProperties: props,
+              witnessSchedule,
+            };
+            await sleep(this.options.pollMs, signal);
+            continue;
+          }
+
+          const { block, virtualOperations } = read;
+
+          if (!block) {
+            yield {
+              ...this.metadata(),
+              type: "gap",
+              blockNumber: nextBlock,
+              retryInMs: this.options.retryMs,
+              dynamicGlobalProperties: props,
+              witnessSchedule,
+            };
+            await sleep(this.options.retryMs, signal);
+            continue;
+          }
+
+          const record = toBlockRecord(nextBlock, block, virtualOperations.length);
+          const newMissedBlocks = missedBlocksFromVirtualOperations(nextBlock, block.timestamp, virtualOperations);
+          if (newMissedBlocks.length > 0) {
+            this.missedBlocks = [...newMissedBlocks, ...this.missedBlocks].slice(0, this.options.maxMissedBlocks ?? 8);
+          }
+
           yield {
             ...this.metadata(),
-            type: "gap",
-            blockNumber: nextBlock,
-            retryInMs: this.options.retryMs,
+            type: "block",
+            block: record,
+            headBlock: props.head_block_number,
+            lag: Math.max(0, props.head_block_number - nextBlock),
             dynamicGlobalProperties: props,
             witnessSchedule,
           };
+          nextBlock += 1;
+        } catch (error) {
+          if (signal?.aborted || isAbortError(error)) break;
+
+          yield {
+            ...this.metadata(),
+            type: "retry",
+            message: error instanceof Error ? error.message : String(error),
+            retryInMs: this.options.retryMs,
+          };
           await sleep(this.options.retryMs, signal);
-          continue;
         }
-
-        const record = toBlockRecord(nextBlock, block, virtualOperations.length);
-        const newMissedBlocks = missedBlocksFromVirtualOperations(nextBlock, block.timestamp, virtualOperations);
-        if (newMissedBlocks.length > 0) {
-          this.missedBlocks = [...newMissedBlocks, ...this.missedBlocks].slice(0, this.options.maxMissedBlocks ?? 8);
-        }
-
-        yield {
-          ...this.metadata(),
-          type: "block",
-          block: record,
-          headBlock: props.head_block_number,
-          lag: Math.max(0, props.head_block_number - nextBlock),
-          dynamicGlobalProperties: props,
-          witnessSchedule,
-        };
-        nextBlock += 1;
-      } catch (error) {
-        if (signal?.aborted || isAbortError(error)) break;
-
-        yield {
-          ...this.metadata(),
-          type: "retry",
-          message: error instanceof Error ? error.message : String(error),
-          retryInMs: this.options.retryMs,
-        };
-        await sleep(this.options.retryMs, signal);
       }
-    }
+    } finally { this.scheduleReader.stop(); }
   }
 
   private metadata(): FollowerMetadata {
@@ -220,22 +224,15 @@ export class BlockFollower {
     return this.hardforkInfo;
   }
 
-  private async refreshWitnessSchedule(client: HiveRpcReadable, props: DynamicGlobalProperties, signal?: AbortSignal): Promise<WitnessSchedule | undefined> {
+  private refreshWitnessSchedule(client: HiveRpcReadable, props: DynamicGlobalProperties, signal?: AbortSignal): void {
     const refreshMs = this.options.witnessScheduleRefreshMs ?? 60_000;
-    const now = Date.now();
-    const round = this.witnessSchedule ? scheduleRound(props.head_block_number, this.witnessSchedule) : undefined;
-    if (this.witnessSchedule && now - this.witnessScheduleFetchedAt < refreshMs) {
-      if (round === undefined || this.witnessScheduleRound === undefined || round === this.witnessScheduleRound) {
-        return this.witnessSchedule;
-      }
-    }
-
-    const nextSchedule = await client.getWitnessSchedule(signal, true);
-    this.updateWitnessScheduleDiagnostics(props, nextSchedule);
-    this.witnessSchedule = nextSchedule;
-    this.witnessScheduleFetchedAt = now;
-    this.witnessScheduleRound = scheduleRound(props.head_block_number, this.witnessSchedule);
-    return this.witnessSchedule;
+    const schedule = this.scheduleReader.schedule;
+    const round = schedule ? scheduleRound(props.head_block_number, schedule) : undefined;
+    const needed = !schedule || Date.now() - this.scheduleReader.fetchedAt >= refreshMs ||
+      (round !== undefined && this.witnessScheduleRound !== undefined && round !== this.witnessScheduleRound);
+    this.scheduleReader.refresh(client, signal, needed, schedule => {
+      this.witnessScheduleRound = scheduleRound(props.head_block_number, schedule);
+    });
   }
 
   private async refreshWitnessRanks(client: HiveRpcReadable, signal?: AbortSignal): Promise<WitnessRanks> {

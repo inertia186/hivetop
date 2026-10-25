@@ -512,3 +512,52 @@ test("slow or unavailable side panels do not stop blocks, retain cached data, an
     assert.equal(rcCalls, 2, "unavailable panels should back off instead of retrying per block");
   } finally { abort.abort(); await iterator.return(); }
 });
+
+test("pending schedule refreshes allow ordered blocks and recover without duplicate requests", async context => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let head = 10, calls = 0, resolveSchedule;
+  const client = {
+    endpoint: 'https://example.test',
+    async getDynamicGlobalProperties() { return { head_block_number: head++, time: '2026-06-16T20:00:00' }; },
+    async getBlock(number) { return { timestamp: '2026-06-16T20:00:00', witness: `w-${number}`, transactions: [] }; },
+    async getVirtualOperationsInBlock() { return [{ op: ['producer_missed', { producer: 'missed' }] }]; },
+    async getHardforkVersion() { return '1.28.0'; },
+    async getNextScheduledHardfork() { return {}; },
+    async getRcStats() { return rcStatsResponse(); },
+    async getWitnessesByVote() { return []; },
+    getWitnessSchedule() { calls++; return new Promise(resolve => { resolveSchedule = resolve; }); },
+  };
+  const abort = new AbortController();
+  const follower = new BlockFollower(client, { startBlock: 10, pollMs: 1000, retryMs: 1000 });
+  const iterator = follower.follow(abort.signal);
+  try {
+    const first = (await iterator.next()).value;
+    const second = (await iterator.next()).value;
+    assert.deepEqual([first.block.number, second.block.number], [10, 11]);
+    assert.equal(second.block.virtualOperationCount, 1);
+    assert.equal(second.missedBlocks[0].witness, 'missed');
+    assert.equal(first.witnessSchedule, undefined);
+    assert.equal(calls, 1);
+    const schedule = { current_shuffled_witnesses: ['alice', 'bob', 'carol'], majority_version: '1.28.0' };
+    resolveSchedule(schedule);
+    await follower.scheduleReader.pending;
+    const third = (await iterator.next()).value;
+    assert.equal(third.block.number, 12);
+    assert.equal(third.witnessSchedule, schedule);
+    assert.equal(third.majorityWitnessVersion, '1.28.0');
+    assert.equal(calls, 2, 'crossing the request round must trigger the next refresh');
+    follower.pause();
+    const pausedRead = iterator.next();
+    await new Promise(setImmediate);
+    context.mock.timers.tick(1000);
+    await new Promise(setImmediate);
+    assert.equal(head, 13, 'paused polling must not fetch blocks or metadata');
+    follower.resume();
+    context.mock.timers.tick(1000);
+    const resumed = (await pausedRead).value;
+    assert.equal(resumed.block.number, 13);
+    follower.resetToHead();
+    const reset = (await iterator.next()).value;
+    assert.equal(reset.block.number, 14);
+  } finally { abort.abort(); await iterator.return(); }
+});
