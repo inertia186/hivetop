@@ -1505,3 +1505,26 @@ test("transaction RPC timeouts retry and stopping the monitor cancels requests",
   } finally { monitor.stop(); }
   assert.equal(signal.aborted, true);
 });
+
+test("status retention trims a large unordered window by block number and preserves replacements", () => {
+  const monitor = new TransactionStatusMonitor({ async findTransaction() { throw new Error('unexpected request'); } }, 0);
+  const history = Array.from({ length: 1201 }, (_, index) => blockRecord(1000 + index, [{ id: `tx-${1000 + index}` }]));
+  const unordered = [...history.filter(b => b.number % 2), ...history.filter(b => !(b.number % 2))];
+  const numbers = unordered.map(b => b.number);
+  try {
+    monitor.sync({ blocks: unordered }, () => {});
+    assert.deepEqual(monitor.displayBlocks().map(b => b.number), Array.from({ length: 300 }, (_, index) => 2200 - index));
+    assert.deepEqual(unordered.map(b => b.number), numbers, 'trimming must not discard metrics rows or reorder their snapshot');
+    assert.equal(monitor.queue.length, 300);
+    const replacement = { ...history.at(-1), sizeBytes: 7777 };
+    const next = blockRecord(2201, [{ id: 'tx-2201' }]);
+    monitor.sync({ blocks: [next, replacement, ...unordered.filter(b => b.number !== 2200)] }, () => {});
+    const retained = monitor.displayBlocks();
+    assert.equal(retained.length, 300);
+    assert.deepEqual(retained.map(b => b.number), Array.from({ length: 300 }, (_, index) => 2201 - index));
+    assert.equal(retained[1], replacement);
+    replacement.sizeBytes = 8888;
+    assert.equal(monitor.displayBlocks()[1].sizeBytes, 8888, 'later size updates must remain visible');
+    assert.ok(monitor.queue.every(tx => tx.blockNumber >= 1902));
+  } finally { monitor.stop(); }
+});
