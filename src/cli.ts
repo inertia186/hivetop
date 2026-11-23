@@ -92,6 +92,7 @@ export async function runFollowLog(client: HiveRpcClient | FailoverHiveRpcClient
   const scheduleTracker = new WitnessScheduleTracker();
   let emittedRecords = 0;
   let gapRetries = 0;
+  let idlePollDeadline: number | undefined;
   const maxGapRetries = options.maxGapRetries ?? DEFAULT_FOLLOW_GAP_RETRIES;
   const gapRetryMs = options.gapRetryMs ?? Math.max(1000, options.pollMs);
 
@@ -115,11 +116,20 @@ export async function runFollowLog(client: HiveRpcClient | FailoverHiveRpcClient
       nextBlock = read.nextBlock;
 
       if (nextBlock > props.head_block_number) {
-        const wake = new AbortController();
-        if (scheduleReader.pending) void scheduleReader.pending.then(() => wake.abort());
-        await sleep(options.pollMs, AbortSignal.any([signal, wake.signal]));
+        if (idlePollDeadline !== undefined) {
+          await sleep(Math.max(0, idlePollDeadline - Date.now()), signal);
+          idlePollDeadline = undefined;
+        } else {
+          const deadline = Date.now() + options.pollMs;
+          const wake = new AbortController();
+          if (scheduleReader.pending) void scheduleReader.pending.then(() => wake.abort());
+          await sleep(options.pollMs, AbortSignal.any([signal, wake.signal]));
+          // A schedule can wake this interval once, even if the head stays put.
+          if (wake.signal.aborted) idlePollDeadline = deadline;
+        }
         continue;
       }
+      idlePollDeadline = undefined;
 
       const { block, virtualOperations } = read;
       if (!block) {

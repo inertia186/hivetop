@@ -172,3 +172,39 @@ test("diagnostic idle polling wakes when the pending schedule completes", async 
     await running;
   } finally { abort.abort(); await running; console.log = originalLog; }
 });
+
+test("diagnostic idle polling allows only one early check per interval when the head stalls", async context => {
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  let headReads = 0;
+  const client = {
+    endpoint: "https://example.test",
+    async getDynamicGlobalProperties() {
+      headReads += 1;
+      return { head_block_number: 10 };
+    },
+    getWitnessSchedule() {
+      return new Promise(resolve => setTimeout(() => resolve({}), 100));
+    },
+  };
+  const abort = new AbortController();
+  const running = runFollowLog(client, { start: 11, pollMs: 1000, follow: true }, abort.signal);
+  const tick = async ms => {
+    context.mock.timers.tick(ms);
+    await new Promise(setImmediate);
+  };
+  try {
+    await tick(0);
+    assert.equal(headReads, 1);
+    await tick(100);
+    assert.equal(headReads, 2);
+    await tick(100);
+    assert.equal(headReads, 2);
+    await tick(799);
+    assert.equal(headReads, 2);
+    await tick(1);
+    assert.equal(headReads, 3);
+  } finally {
+    abort.abort();
+    await running;
+  }
+});

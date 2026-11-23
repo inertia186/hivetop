@@ -72,6 +72,7 @@ export async function runFollowLog(client, options, signal) {
     const scheduleTracker = new WitnessScheduleTracker();
     let emittedRecords = 0;
     let gapRetries = 0;
+    let idlePollDeadline;
     const maxGapRetries = options.maxGapRetries ?? DEFAULT_FOLLOW_GAP_RETRIES;
     const gapRetryMs = options.gapRetryMs ?? Math.max(1000, options.pollMs);
     const scheduleReader = new WitnessScheduleReader();
@@ -91,12 +92,23 @@ export async function runFollowLog(client, options, signal) {
             const { props, schedule } = read;
             nextBlock = read.nextBlock;
             if (nextBlock > props.head_block_number) {
-                const wake = new AbortController();
-                if (scheduleReader.pending)
-                    void scheduleReader.pending.then(() => wake.abort());
-                await sleep(options.pollMs, AbortSignal.any([signal, wake.signal]));
+                if (idlePollDeadline !== undefined) {
+                    await sleep(Math.max(0, idlePollDeadline - Date.now()), signal);
+                    idlePollDeadline = undefined;
+                }
+                else {
+                    const deadline = Date.now() + options.pollMs;
+                    const wake = new AbortController();
+                    if (scheduleReader.pending)
+                        void scheduleReader.pending.then(() => wake.abort());
+                    await sleep(options.pollMs, AbortSignal.any([signal, wake.signal]));
+                    // A schedule can wake this interval once, even if the head stays put.
+                    if (wake.signal.aborted)
+                        idlePollDeadline = deadline;
+                }
                 continue;
             }
+            idlePollDeadline = undefined;
             const { block, virtualOperations } = read;
             if (!block) {
                 gapRetries += 1;
