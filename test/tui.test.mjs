@@ -178,10 +178,10 @@ test("size measurements run only in their view, cancel on leaving, cache results
   process.stdout.write = (chunk) => { output = String(chunk); return true; };
   const requests = [];
   const ui = new TerminalUi({ node: "test", windowSeconds: 120, onQuit() {}, onPauseToggle() {}, onReset() {},
-    transactionStatusClient: { getBlockSize(number, signal) {
-      return new Promise((resolve, reject) => requests.push({ number, signal, resolve, reject }));
+    transactionStatusClient: { getBlockSize(number, signal, source) {
+      return new Promise((resolve, reject) => requests.push({ number, signal, source, resolve, reject }));
     } } });
-  const block = { ...blockRecord(104), timestamp: new Date() };
+  const block = { ...blockRecord(104), timestamp: new Date(), blockId: "followed-id", rpcEndpoint: "https://followed.test" };
   const event = { type: "block", block, headBlock: 104, lag: 0,
     dynamicGlobalProperties: { head_block_number: 104, time: block.timestamp.toISOString() },
     witnessRanks: {}, witnessFeedUpdates: {}, witnessVersions: {}, missedBlocks: [] };
@@ -192,6 +192,7 @@ test("size measurements run only in their view, cancel on leaving, cache results
     assert.equal(requests.length, 0);
     openSizes();
     assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].source, { blockId: block.blockId, endpoint: block.rpcEndpoint });
     ui.onKey("v");
     assert.equal(requests[0].signal.aborted, true);
     requests[0].resolve(128);
@@ -210,6 +211,7 @@ test("size measurements run only in their view, cancel on leaving, cache results
     ui.sizeRetryAt = 0;
     ui.render({ ...event, block: newer }, { ...snapshot, blocks: [newer, block] });
     requests[2].reject(new Error("Serialization API unavailable"));
+    assert.equal(requests[2].source, undefined); // Records without provenance keep cold sizing.
     await sleep(1);
     assert.match(output, /Size RPC: Serialization API unavailable/);
     ui.render(event, { ...snapshot, blocks: [newer, block] });

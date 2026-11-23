@@ -58,6 +58,132 @@ test("block sizes include envelopes and signatures while serializing operations 
   await assert.rejects(client.getBlockSize(4), /Unsupported block header extension/);
 });
 
+test("size payload reuse requires exact identity, is bounded, and is consumed on failure", async () => {
+  let block = sizeBlock(), failHex = false;
+  const calls = [];
+  const client = new HiveRpcClient("https://one.test", async (_url, init) => {
+    const request = JSON.parse(init.body);
+    calls.push(request.method);
+    if (request.method.endsWith("get_block")) return response({ result: structuredClone(block) });
+    return response({ result: failHex ? "invalid" : "00".repeat(15) });
+  });
+  const source = { endpoint: client.endpoint, blockId: block.block_id };
+  const measure = async (expectedCalls, expectedSource = source, number = 1) => {
+    const before = calls.length;
+    const size = await client.getBlockSize(number, undefined, expectedSource);
+    assert.equal(calls.length - before, expectedCalls);
+    return size;
+  };
+  await client.getBlock(1);
+  assert.equal(await measure(0), 117);
+  await measure(1); // Single use, including the empty-block case.
+  for (const [number, identity] of [[2, source], [1, { ...source, blockId: "other" }], [1, { ...source, endpoint: "https://two.test" }], [1, undefined]]) {
+    await client.getBlock(1);
+    const before = calls.length;
+    await client.getBlockSize(number, undefined, identity);
+    assert.equal(calls.length - before, 1);
+  }
+  await client.getBlock(1);
+  block.witness = "a replacement witness";
+  block.block_id = "cd".repeat(20);
+  await client.getBlock(1);
+  await measure(1); // The earlier identity cannot reuse the replacement payload.
+  block = sizeBlock();
+  block.transactions = [{ operations: [["vote", {}]], signatures: ["00".repeat(65)] }];
+  await client.getBlock(1);
+  failHex = true;
+  await assert.rejects(client.getBlockSize(1, undefined, source), /Invalid serialized/);
+  failHex = false;
+  assert.equal(await measure(2), 197); // Retry fetches a new block and serializes again.
+  await client.getBlock(1);
+  block = null;
+  assert.equal(await client.getBlock(2), null);
+  assert.equal(await measure(1), undefined);
+  block = { ...sizeBlock(), padding: "x".repeat(524288) };
+  await client.getBlock(1);
+  assert.equal(client.sizePayload, undefined);
+  await measure(1);
+  block = sizeBlock();
+  await client.getBlock(1);
+  const cancelled = AbortSignal.abort();
+  const before = calls.length;
+  await assert.rejects(client.getBlockSize(1, cancelled, source), { name: "AbortError" });
+  assert.equal(calls.length, before);
+});
+
+test("late and aborted block reads cannot replace the latest size payload", async () => {
+  const pending = [];
+  const client = new HiveRpcClient("https://one.test", (_url, init) => new Promise(resolve => pending.push({ resolve, init })));
+  const old = client.getBlock(1);
+  const newer = client.getBlock(2);
+  pending[1].resolve(response({ result: sizeBlock("new") }));
+  await newer;
+  pending[0].resolve(response({ result: sizeBlock("old") }));
+  await old;
+  assert.equal(await client.getBlockSize(2, undefined, { endpoint: client.endpoint, blockId: "new" }), 117);
+  assert.equal(pending.length, 2);
+  const abort = new AbortController();
+  const cancelled = client.getBlock(3, abort.signal);
+  abort.abort();
+  pending[2].resolve(response({ result: sizeBlock("cancelled") }));
+  await cancelled;
+  assert.equal(client.sizePayload, undefined);
+});
+
+test("cancelling cached serialization discards its payload and keeps the retry cold", async () => {
+  const block = sizeBlock();
+  block.transactions = [{ operations: [["vote", {}]], signatures: [] }];
+  let blockCalls = 0, started;
+  const serializing = new Promise(resolve => { started = resolve; });
+  const client = new HiveRpcClient("https://one.test", async (_url, init) => {
+    if (JSON.parse(init.body).method.endsWith("get_block")) {
+      blockCalls++;
+      return response({ result: block });
+    }
+    started();
+    return new Promise((resolve, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+  });
+  await client.getBlock(1);
+  const source = { endpoint: client.endpoint, blockId: block.block_id };
+  const abort = new AbortController();
+  const request = client.getBlockSize(1, abort.signal, source);
+  await serializing;
+  abort.abort();
+  await assert.rejects(request, { name: "AbortError" });
+  assert.equal(client.sizePayload, undefined);
+  block.transactions = [];
+  assert.equal(await client.getBlockSize(1, undefined, source), 117);
+  assert.equal(blockCalls, 2);
+});
+
+test("failover size measurements do not reuse another endpoint's followed payload", async () => {
+  let failFirst = false;
+  const calls = [];
+  const client = new FailoverHiveRpcClient(["https://one.test", "https://two.test"], endpoint => new HiveRpcClient(endpoint, async (_url, init) => {
+    const request = JSON.parse(init.body);
+    calls.push([endpoint, request.method]);
+    if (endpoint.endsWith("one.test") && failFirst) throw new Error("offline");
+    return response({ result: sizeBlock() });
+  }));
+  await client.getBlock(1);
+  const firstSource = { endpoint: client.endpoint, blockId: "ab".repeat(20) };
+  assert.equal(await client.getBlockSize(1, undefined, firstSource), 117);
+  failFirst = true;
+  await client.getBlock(1);
+  const before = calls.length;
+  assert.equal(await client.getBlockSize(1, undefined, firstSource), 117);
+  assert.deepEqual(calls.slice(before), [["https://two.test", "condenser_api.get_block"]]);
+  await client.getBlock(1);
+  const beforeReuse = calls.length;
+  assert.equal(await client.getBlockSize(1, undefined, { ...firstSource, endpoint: client.endpoint }), 117);
+  assert.equal(calls.length, beforeReuse);
+});
+
+function sizeBlock(id = "ab".repeat(20)) {
+  return { block_id: id, previous: "00".repeat(20), timestamp: "2026-10-25T00:00:00", witness: "alice",
+    transaction_merkle_root: "00".repeat(20), witness_signature: "00".repeat(65), extensions: [], transactions: [] };
+}
+
 test("HiveRpcClient sends hardfork version requests", async () => {
   const requests = [];
   const client = new HiveRpcClient("https://example.test", async (_url, init) => {
@@ -199,7 +325,7 @@ test("HiveRpcClient sends batched transaction status requests", async () => {
       request.map((item, index) => ({
         id: item.id,
         result: { status: index === 0 ? "within_reversible_block" : "within_irreversible_block", block_num: 123 + index },
-      })),
+      })).reverse(), // A node may return batch responses in any order.
     );
   });
 

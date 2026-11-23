@@ -28,12 +28,17 @@ interface RpcResponse {
 type FetchLike = (url: string, init: RpcRequestInit) => Promise<RpcResponse>;
 type RpcHeaders = Record<string, string | undefined>;
 
+export interface BlockSizeSource {
+  endpoint: string;
+  blockId: string;
+}
+
 export interface HiveRpcReadable {
   readonly endpoint: string;
   readonly health?: { lastResponseAt?: number; latencyMs?: number };
   getDynamicGlobalProperties(signal?: AbortSignal): Promise<DynamicGlobalProperties>;
   getBlock(blockNumber: number, signal?: AbortSignal): Promise<HiveBlock | null>;
-  getBlockSize?(blockNumber: number, signal?: AbortSignal): Promise<number | undefined>;
+  getBlockSize?(blockNumber: number, signal?: AbortSignal, source?: BlockSizeSource): Promise<number | undefined>;
   getVirtualOperationsInBlock(blockNumber: number, signal?: AbortSignal): Promise<AppliedOperation[]>;
   getHardforkVersion(signal?: AbortSignal): Promise<string>;
   getNextScheduledHardfork(signal?: AbortSignal): Promise<NextScheduledHardfork>;
@@ -112,6 +117,8 @@ export class HiveRpcError extends Error {
 
 export class HiveRpcClient implements HiveRpcReadable {
   private id = 0;
+  private blockRead = 0;
+  private sizePayload: { number: number; blockId: string; json: string } | undefined;
   readonly health: { lastResponseAt?: number; latencyMs?: number } = {};
 
   constructor(public readonly endpoint: string, private readonly fetchImpl: FetchLike = defaultFetch, private readonly timeoutMs = 10_000) {}
@@ -121,11 +128,24 @@ export class HiveRpcClient implements HiveRpcReadable {
   }
 
   async getBlock(blockNumber: number, signal?: AbortSignal): Promise<HiveBlock | null> {
-    return this.call<HiveBlock | null>("condenser_api.get_block", [blockNumber], signal);
+    const read = ++this.blockRead;
+    this.sizePayload = undefined;
+    const block = await this.call<HiveBlock | null>("condenser_api.get_block", [blockNumber], signal);
+    if (read === this.blockRead && !signal?.aborted && block?.block_id) {
+      const json = JSON.stringify(block);
+      // Bound retained string storage to 1 MiB; oversized blocks use cold sizing.
+      if (json.length <= 524_288) this.sizePayload = { number: blockNumber, blockId: block.block_id, json };
+    }
+    return block;
   }
 
-  async getBlockSize(blockNumber: number, signal?: AbortSignal): Promise<number | undefined> {
-    const block = await this.getBlock(blockNumber, signal);
+  async getBlockSize(blockNumber: number, signal?: AbortSignal, source?: BlockSizeSource): Promise<number | undefined> {
+    signal?.throwIfAborted();
+    const cached = this.sizePayload;
+    this.sizePayload = undefined; // A failed or cancelled measurement retries with a fresh block.
+    const block = cached?.number === blockNumber && cached.blockId === source?.blockId && source.endpoint === this.endpoint
+      ? JSON.parse(cached.json) as HiveBlock
+      : await this.call<HiveBlock | null>("condenser_api.get_block", [blockNumber], signal);
     if (!block) return undefined;
     const headerBytes = signedBlockHeaderBytes(block);
     const transactions = block.transactions ?? [];
@@ -290,9 +310,9 @@ export class FailoverHiveRpcClient implements HiveRpcReadable {
     return this.withStableEndpoint((client) => client.getBlock(blockNumber, signal), signal);
   }
 
-  async getBlockSize(blockNumber: number, signal?: AbortSignal): Promise<number | undefined> {
+  async getBlockSize(blockNumber: number, signal?: AbortSignal, source?: BlockSizeSource): Promise<number | undefined> {
     if (!this.current.getBlockSize) throw new Error("Block-size measurements are unavailable on this node");
-    return this.current.getBlockSize(blockNumber, signal);
+    return this.current.getBlockSize(blockNumber, signal, source);
   }
 
   async getVirtualOperationsInBlock(blockNumber: number, signal?: AbortSignal): Promise<AppliedOperation[]> {

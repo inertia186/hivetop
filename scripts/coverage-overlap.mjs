@@ -213,6 +213,34 @@ async function measure(output) {
   } finally { await rm(scratch, { recursive: true, force: true }); }
 }
 
+function lostFeatures(before, after) {
+  return featureSpace([before, after]).filter(feature => covered(before, feature) && !covered(after, feature));
+}
+
+async function compare(workspace, output) {
+  workspace = await realpath(workspace);
+  const beforeHashes = await sourceHashes(workspace), afterHashes = await sourceHashes(root);
+  const runtime = hashes => Object.fromEntries(Object.entries(hashes).filter(([path]) => /^(src|dist)\//.test(path)));
+  assert.deepEqual(runtime(beforeHashes), runtime(afterHashes), "Coverage comparison requires identical production source/runtime");
+  const scratch = await mkdtemp(join(tmpdir(), "hivetop-coverage-compare-"));
+  try {
+    const files = (await readdir(join(root, "test"))).filter(name => name.endsWith(".test.mjs")).sort().map(name => `test/${name}`);
+    const before = await capture(workspace, files, scratch, "before");
+    const after = await capture(root, files, scratch, "after");
+    assert.deepEqual(after.cases.map(t => [t.file, t.name]), before.cases.map(t => [t.file, t.name]), "Preserve the same test cases");
+    const lost = lostFeatures(before, after);
+    assert.deepEqual(await sourceHashes(workspace), beforeHashes);
+    assert.deepEqual(await sourceHashes(root), afterHashes);
+    const report = { date: new Date().toISOString(), node: process.version, beforeHashes, afterHashes,
+      testCount: after.cases.length, beforeNative: before.native, afterNative: after.native, lost,
+      method: "Compare covered lines, functions and function-scoped V8 segments partitioned at both runs' range boundaries; native totals are reported separately." };
+    await mkdir(dirname(output), { recursive: true });
+    await writeFile(output, JSON.stringify(report, null, 2) + "\n", { flag: "wx" });
+    assert.deepEqual(lost, [], "Previously covered source regions must remain covered");
+    console.log(`${after.cases.length} cases; no previously covered lines, functions or normalized V8 segments lost.`);
+  } finally { await rm(scratch, { recursive: true, force: true }); }
+}
+
 async function verify() {
   const range = (startOffset, endOffset, count) => ({ startOffset, endOffset, count });
   const fixture = records => ({ cases: [{ name: "fixture" }], lines: new Set(), functions: new Map([["dist/a.js:0:100",
@@ -222,6 +250,8 @@ async function verify() {
   assert.equal(covered(full, feature), false);
   assert.equal(covered(fixture([[range(0, 100, 1)]]), feature), true);
   assert.equal(covered(fixture([[range(0, 100, 0)], [range(0, 100, 1)]]), feature), true);
+  assert.deepEqual(lostFeatures(full, full), []);
+  assert.ok(lostFeatures(fixture([[range(0, 100, 1)]]), full).some(f => f.kind === "block" && f.start === 20 && f.end === 40));
   const analysis = analyze(full, [fixture([[range(0, 100, 0)]])], [full, full]);
   assert.ok(analysis.ranked[0].featureIds.length);
   assert.ok(analysis.ranked.every(row => row.uniqueFeatureIds.length === 0));
@@ -256,7 +286,8 @@ test('left (a+b)',()=>assert.equal(choose(true),1)); test('right',()=>assert.equ
 if (process.argv[1] && resolve(process.argv[1]) === script) {
   const args = process.argv.slice(2);
   assert.ok(Number(process.versions.node.split(".")[0]) >= 24, "Use Node >=24");
-  assert.ok(args.length === 1 && args[0] === "--verify" || args.length === 2 && args[0] === "--output",
-    "Usage: node scripts/coverage-overlap.mjs --verify | --output report.json");
-  (args[0] === "--verify" ? verify() : measure(resolve(args[1]))).catch(error => { console.error(error); process.exitCode = 1; });
+  assert.ok(args.length === 1 && args[0] === "--verify" || args.length === 2 && args[0] === "--output" || args.length === 4 && args[0] === "--compare" && args[2] === "--output",
+    "Usage: node scripts/coverage-overlap.mjs --verify | --output report.json | --compare BASELINE_WORKSPACE --output report.json");
+  (args[0] === "--verify" ? verify() : args[0] === "--compare" ? compare(resolve(args[1]), resolve(args[3])) : measure(resolve(args[1])))
+    .catch(error => { console.error(error); process.exitCode = 1; });
 }

@@ -65,6 +65,8 @@ export class HiveRpcClient {
     fetchImpl;
     timeoutMs;
     id = 0;
+    blockRead = 0;
+    sizePayload;
     health = {};
     constructor(endpoint, fetchImpl = defaultFetch, timeoutMs = 10_000) {
         this.endpoint = endpoint;
@@ -75,10 +77,24 @@ export class HiveRpcClient {
         return this.call("condenser_api.get_dynamic_global_properties", [], signal);
     }
     async getBlock(blockNumber, signal) {
-        return this.call("condenser_api.get_block", [blockNumber], signal);
+        const read = ++this.blockRead;
+        this.sizePayload = undefined;
+        const block = await this.call("condenser_api.get_block", [blockNumber], signal);
+        if (read === this.blockRead && !signal?.aborted && block?.block_id) {
+            const json = JSON.stringify(block);
+            // Bound retained string storage to 1 MiB; oversized blocks use cold sizing.
+            if (json.length <= 524_288)
+                this.sizePayload = { number: blockNumber, blockId: block.block_id, json };
+        }
+        return block;
     }
-    async getBlockSize(blockNumber, signal) {
-        const block = await this.getBlock(blockNumber, signal);
+    async getBlockSize(blockNumber, signal, source) {
+        signal?.throwIfAborted();
+        const cached = this.sizePayload;
+        this.sizePayload = undefined; // A failed or cancelled measurement retries with a fresh block.
+        const block = cached?.number === blockNumber && cached.blockId === source?.blockId && source.endpoint === this.endpoint
+            ? JSON.parse(cached.json)
+            : await this.call("condenser_api.get_block", [blockNumber], signal);
         if (!block)
             return undefined;
         const headerBytes = signedBlockHeaderBytes(block);
@@ -222,10 +238,10 @@ export class FailoverHiveRpcClient {
     async getBlock(blockNumber, signal) {
         return this.withStableEndpoint((client) => client.getBlock(blockNumber, signal), signal);
     }
-    async getBlockSize(blockNumber, signal) {
+    async getBlockSize(blockNumber, signal, source) {
         if (!this.current.getBlockSize)
             throw new Error("Block-size measurements are unavailable on this node");
-        return this.current.getBlockSize(blockNumber, signal);
+        return this.current.getBlockSize(blockNumber, signal, source);
     }
     async getVirtualOperationsInBlock(blockNumber, signal) {
         return this.withStableEndpoint((client) => client.getVirtualOperationsInBlock(blockNumber, signal), signal);

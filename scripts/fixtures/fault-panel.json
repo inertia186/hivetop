@@ -1,0 +1,10 @@
+[
+  { "id": "size-endpoint", "file": "dist/rpc.js", "before": " && source.endpoint === this.endpoint", "after": "" },
+  { "id": "size-identity", "file": "dist/rpc.js", "before": " && cached.blockId === source?.blockId", "after": "" },
+  { "id": "late-block", "file": "dist/rpc.js", "before": "read === this.blockRead && ", "after": "" },
+  { "id": "retention-order", "file": "dist/tui.js", "before": "[...this.retainedBlocks.keys()].sort((a, b) => a - b).slice(0, excess)", "after": "[...this.retainedBlocks.keys()].sort((a, b) => b - a).slice(0, excess)" },
+  { "id": "batch-order", "file": "dist/rpc.js", "before": "responses.get(request.id)", "after": "payload[requests.indexOf(request)]" },
+  { "id": "schedule-backoff", "file": "dist/rpc.js", "before": "Date.now() - this.error.at < 30_000", "after": "Date.now() - this.error.at < 0" },
+  { "id": "cancelled-schedule", "file": "dist/rpc.js", "before": "            if (requestSignal.aborted)\n                return;\n", "after": "" },
+  { "id": "visible-retention", "file": "dist/tui.js", "before": "            if (this.visibleBlockNumbers.has(block.number))\n                continue;\n", "after": "" }
+]
