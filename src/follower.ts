@@ -93,7 +93,7 @@ export class BlockFollower {
                 return { props, witnessSchedule: this.scheduleReader.schedule, nextBlock: effectiveNextBlock };
               }
               const [block, virtualOperations] = await readBlockWithSchedule(client, effectiveNextBlock, this.scheduleReader.pending, signal);
-              return { props, witnessSchedule: this.scheduleReader.schedule, nextBlock: effectiveNextBlock, block, virtualOperations };
+              return { props, witnessSchedule: this.scheduleReader.schedule, nextBlock: effectiveNextBlock, block, virtualOperations, blockEndpoint: client.endpoint };
             },
             signal,
           );
@@ -139,6 +139,7 @@ export class BlockFollower {
           }
 
           const record = toBlockRecord(nextBlock, block, virtualOperations.length);
+          record.rpcEndpoint = read.blockEndpoint;
           const newMissedBlocks = missedBlocksFromVirtualOperations(nextBlock, block.timestamp, virtualOperations);
           if (newMissedBlocks.length > 0) {
             this.missedBlocks = [...newMissedBlocks, ...this.missedBlocks].slice(0, this.options.maxMissedBlocks ?? 8);
@@ -431,6 +432,7 @@ export function toBlockRecord(number: number, block: HiveBlock, virtualOperation
 
   return {
     number,
+    ...(block.block_id ? { blockId: block.block_id } : {}),
     timestamp: new Date(`${block.timestamp}Z`),
     witness: block.witness,
     transactionCount: transactions.length,

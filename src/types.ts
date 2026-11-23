@@ -169,6 +169,8 @@ export interface RcInfo {
 
 export interface BlockRecord {
   number: number;
+  blockId?: string;
+  rpcEndpoint?: string;
   timestamp: Date;
   witness: string;
   sizeBytes?: number;

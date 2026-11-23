@@ -340,7 +340,8 @@ export class TerminalUi {
             return;
         }
         const abort = this.sizeAbort = new AbortController();
-        void client.getBlockSize(block.number, abort.signal).then((size) => {
+        const source = block.blockId && block.rpcEndpoint ? { blockId: block.blockId, endpoint: block.rpcEndpoint } : undefined;
+        void client.getBlockSize(block.number, abort.signal, source).then((size) => {
             if (abort.signal.aborted)
                 return;
             if (size === undefined || !Number.isFinite(size) || size < 0)

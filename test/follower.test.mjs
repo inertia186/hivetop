@@ -43,11 +43,13 @@ test("toBlockRecord counts transactions and operation types", () => {
 test("BlockFollower follows sequentially using the chain's majority version", async () => {
   let hardforkVersionCalls = 0;
   const client = {
+    endpoint: "https://followed.test",
     async getDynamicGlobalProperties() {
       return { head_block_number: 11, time: "2026-06-16T20:00:00" };
     },
     async getBlock(blockNumber) {
       return {
+        block_id: `id-${blockNumber}`,
         timestamp: "2026-06-16T20:00:00",
         witness: `witness-${blockNumber}`,
         transactions: [],
@@ -87,6 +89,7 @@ test("BlockFollower follows sequentially using the chain's majority version", as
 
   assert.deepEqual(events.map((event) => event.type), ["block", "block"]);
   assert.deepEqual(events.map((event) => event.block.number), [10, 11]);
+  assert.deepEqual(events.map((event) => [event.block.blockId, event.block.rpcEndpoint]), [["id-10", client.endpoint], ["id-11", client.endpoint]]);
   assert.deepEqual(events.map((event) => event.block.virtualOperationCount), [1, 2]);
   assert.deepEqual(events.map((event) => event.dynamicGlobalProperties.head_block_number), [11, 11]);
   assert.deepEqual(events.map((event) => event.hardforkInfo.currentVersion), ["1.28.0", "1.28.0"]);

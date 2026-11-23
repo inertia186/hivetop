@@ -2,8 +2,9 @@
 
 Baseline investigation: 2026-10-24, `4610edf` (v1.10.0), Apple M2 / macOS arm64,
 Node 24.16.0. The starting suite had 122 passing tests. Results below were
-recorded on 2026-10-25. The current suite has 129 tests after consolidation and
-new asynchronous/retention regressions.
+recorded on 2026-10-25. The suite reached 129 tests after consolidation and
+new asynchronous/retention regressions. The block-size hill adds four cases,
+bringing the current suite to 133 tests.
 
 Raw measurements and full session notes remain local in the ignored
 `benchmarks/` directory. They are not committed. This file preserves the scores,
@@ -186,8 +187,9 @@ outside these measurements.
 
 ## 4. Measure block sizes with fewer duplicate fetches
 
-**Not started.** `getBlockSize` fetches a block that the follower may have just
-received, then requests serialized operations for nonempty blocks.
+**Baseline:** 2026-10-25 at `0b882ed`. `getBlockSize` refetches a block that the
+follower may have just received, then requests serialized operations for
+nonempty blocks. The unchanged runtime was captured before editing.
 
 **Score and target:** For newly followed payloads, reduce additional calls from
 two to one for nonempty blocks and one to zero for empty blocks. Cold backfill
@@ -198,6 +200,69 @@ chart gaps and peaks, cancellation, one-per-second backfill, and error backoff.
 Set a memory ceiling before retaining raw payloads. Test signatures, header
 extensions, empty blocks, large transaction counts, serialization failures,
 view changes, filtering, replacements, and retries.
+
+Candidate constraints fixed before editing: keep at most one serialized payload
+per endpoint client, with at most 524,288 UTF-16 code units (1 MiB string storage,
+excluding object headers and transient serialization). Reuse only for the exact
+followed block ID and endpoint, consume once, and refetch on retries. Oversized
+blocks use the original path. Cold measurements must keep their request count
+and serial dependency depth; added follower p95 processing must remain below
+5 ms in the fixed fixtures. Seven alternating warmed pairs compare exact sizes,
+requests and measured elapsed time; modeled latency assumes 100 ms RPC bodies.
+
+**Accepted:** Cache the latest fetched block as a bounded serialized string.
+Carry block ID and endpoint through follower records into size requests. Match
+both identities and the block number before consuming the payload; the next
+followed-block read invalidates it, and late or aborted reads cannot replace it. Serialization
+failures/cancellation consume the entry, so subsequent measurements refetch.
+Cold size reads bypass cache creation. Existing backfill pacing, filtering,
+chart rendering, and error backoff remain unchanged.
+
+The deterministic fetch/serializer double assigns two serialized bytes per
+operation and uses signed headers, signatures, header extensions, 128-transaction
+blocks, and 500,000-/600,000-character operation payloads. Each trace measures
+100 blocks, except longer cold controls with 10,000 measurements. Seven warmed,
+alternating pairs per fixture produce 84 measured traces with identical sizes.
+
+| Fixture | Additional calls/block, baseline → accepted | Modeled size-request latency |
+| --- | ---: | ---: |
+| Fresh empty | 1 → 0 | 100 → 0 ms |
+| Fresh, 128 transactions | 2 → 1 | 200 → 100 ms |
+| Fresh empty, header extensions | 1 → 0 | 100 → 0 ms |
+| Fresh, large cacheable operation | 2 → 1 | 200 → 100 ms |
+| Cold backfill | 2 → 2 | 200 → 200 ms |
+| Oversized, uncached | 2 → 2 | 200 → 200 ms |
+
+Including the original follower fetch, total requests for 100 fresh empty blocks
+fall 200 → 100; nonempty blocks fall 300 → 200. Longer cold controls keep 20,000
+requests, a median paired elapsed ratio of 0.984, and unchanged serial request
+depth. The initial 100-measurement cold sample took under 1 ms and showed a small
+timing difference; longer controls were added rather than treating that sample
+as evidence of a speed change.
+
+**Costs and limits:** Cache encoding adds work to followed blocks in every view.
+Across the final paired runs, worst fetched-block p95 is 0.577 ms, below the
+predeclared 5 ms ceiling. Whole-trace local elapsed ratios are 1.635 for the large
+cacheable operation and 1.390 for oversized blocks; no general CPU improvement
+is claimed. Peak retained payload string is 1,001,250 bytes by the conservative
+two-bytes-per-code-unit accounting; oversized blocks retain none. The cap is per
+endpoint client, and does not bound transient allocations or whole-process heap.
+Blocks without provenance or whose payload has been evicted use cold backfill.
+Real RPC latency, real operation serialization and terminal painting were not
+measured; latency figures in the table are request accounting, not elapsed time.
+
+At the time of the cache measurement, all 133 tests passed with coverage,
+including identity propagation, endpoint failover, replacements, late responses,
+null reads, bounds, serialization errors, cancellation, retries, view changes,
+and the existing chart/filter assertions.
+The 224-trace metadata replay also passes against the previous accepted runtime.
+
+```sh
+mkdir -p /tmp/hivetop-size-original
+git archive 0b882ed dist package.json | tar -x -C /tmp/hivetop-size-original
+npm run build
+node scripts/size-baseline.mjs /tmp/hivetop-size-original /tmp/hivetop-size.json
+```
 
 ## 5. Remove redundant tests without losing behavior checks
 
@@ -225,6 +290,234 @@ npm run coverage:overlap -- --output /tmp/hivetop-overlap.json
 
 Coverage ranks candidates; it does not prove assertion equivalence. Native V8
 branch identifiers vary, so the collector also compares normalized source ranges.
+
+## 6. Reject malformed RPC responses before they reach callers
+
+**Not started.** Source inspection on 2026-10-25, at `0b882ed` plus the
+uncommitted block-size hill, found no explicit `any` return annotations in
+`src/`. The RPC boundary accepts `unknown` JSON, then asserts response envelopes
+and results as generic `T` without checking the result shape. Removing casts
+alone earns no improvement.
+
+**Score:** Percentage of a fixed malformed-response fixture matrix rejected
+at the RPC boundary with a method-specific `HiveRpcError`, before an invalid
+value reaches a caller. Report the count and outcome for every fixture and RPC
+method, alongside valid-response acceptance. The numerical baseline has not
+been measured; record its date and exact runtime commit before changing code.
+
+**Target:** Reject 100% of the fixed malformed fixtures and preserve 100% of
+valid controls. Freeze fixtures and expected outcomes before implementation.
+Cover null/primitive envelopes, missing results, invalid error objects, wrong
+consumed field types, malformed nested arrays, and missing, duplicate, or
+mismatched batch IDs. Include valid null blocks, empty arrays, optional fields,
+unknown extra fields, and out-of-order batch responses as controls.
+
+Validate the envelope and fields callers actually consume for each supported
+RPC method; keep untrusted data as `unknown` until checked. Preserve legitimate
+empty/null results, response headers, status strings that allow future values,
+method context in errors, cancellation, deadlines, failover, and retry/backoff
+behavior. Do not introduce requests, silently substitute defaults, or require a
+new runtime dependency. Fix a processing-overhead ceiling before implementation
+and measure it with representative large valid responses.
+
+**How to measure:** Add a deterministic response-injection runner using the
+existing fetch double. Run the frozen matrix against the unchanged baseline
+and each candidate, asserting both rejection location/error and valid returned
+values. Exercise malformed responses through the follower and failover paths
+to check recovery, then run `npm run test:coverage`. Keep raw reports in ignored
+`benchmarks/`; record the fixture counts, scores, command, baseline commit, and
+accepted tradeoffs here when the hill is run.
+
+## 7. Make existing tests detect more faults
+
+Borrowed from Hyperion hill #10. Freeze eight independently witnessed faults
+before scoring: wrong size endpoint, wrong size block ID, late block overwrite,
+reversed retention eviction, batch-response ordering, skipped schedule backoff,
+late cancelled schedule acceptance, and dropping visible completed blocks.
+Apply each only in a disposable runtime copy; syntax errors, timeouts and
+unrelated failures do not count as detections. The independent witness must pass
+on the unchanged runtime and fail on its mutant before the suite is scored.
+
+**Score and target:** Halve undetected faults, preserving all prior detections,
+covered lines/branches, and normal passing tests. Freeze production and panel
+inputs while improving tests. Keep suite count at or below the current 133 and
+median uninstrumented suite time within 10% of a fresh control. If every fault
+is already detected, record saturation rather than replacing the panel to earn
+a gain. Baseline date, source hashes, outcomes, and commands follow below.
+
+**Baseline, 2026-10-25:** `0b882ed` plus the uncommitted block-size hill; exact
+runtime/test/panel hashes are in the local report. All eight witnesses pass on
+the unchanged runtime, fail with assertion exit 42 on their mutant, and each
+mutant passes syntax validation. Three clean controls pass all 133 tests with
+wall times 1,285, 1,250 and 1,245 ms (median 1,250 ms).
+
+| Fault | Suite outcome |
+| --- | --- |
+| Wrong size endpoint | Detected |
+| Wrong size block ID | Detected |
+| Late block overwrites the latest payload | Timeout; not counted as detection |
+| Evict newest retained block | Detected |
+| Map batch results by response order instead of ID | Missed; suite passes |
+| Skip schedule error backoff | Detected |
+| Publish cancelled schedule response | Detected |
+| Drop completed visible blocks | Detected |
+
+Detection is **6/8**; the two faults without a counted detection set a target of
+at least **7/8**, preserving the six current detections. These are test gaps,
+not claims that the unchanged application contains the injected faults. The
+late-read mutant leaves a mocked fetch pending; Node's 10-second test timeout
+terminates it. Timeout/failure logs remain local and the runner does not treat
+them as successful detection. A future test improvement should assert the bad
+state before it waits indefinitely. Production code and tests were not edited
+in this baseline pass.
+
+```sh
+npm run build
+node scripts/fault-baseline.mjs benchmarks/fault-baseline.json
+```
+
+The driver copies runtime/tests into a temporary directory, links the existing
+development dependencies, freezes the panel, and restores/removes the copy in
+`finally`. It runs tests directly against each compiled mutant without a build
+that would erase it. An initial setup run lacked the terminal test dependency;
+a later outer-timeout attempt did not complete the panel. Neither contributes
+scores. The completed report and assertion logs provide the baseline above.
+
+**Accepted test improvement, 2026-10-25:** Reverse the response array in the
+existing batch-status fixture while preserving its request and returned-status
+assertions. The two results have distinct statuses, so associating them by
+array position now fails the same test. No test cases or production changes
+were added by this pass.
+
+The unchanged frozen panel improves **6/8 → 7/8 detections**; faults without a
+counted detection fall **2 → 1**, meeting the halving target. All six original
+detections remain. The batch-order mutant now fails specifically in
+`HiveRpcClient sends batched transaction status requests`. The late-read mutant
+still reaches the 10-second test timeout and does not count as detected. Stop
+at the target rather than changing the panel or continuing to tune tests.
+
+Fresh control and candidate both pass **133 tests** in three uninstrumented
+runs. Median complete command wall time is **1,266.8 → 1,254.2 ms**, ratio
+**0.990**, within the fixed 10% guard; this is not a claim of a reliable speed
+improvement. Runtime, panel, witnesses, and mutation hashes are identical.
+Only the batch fixture changes among test inputs.
+
+Coverage comparison also runs each complete suite against identical production
+source. Both cover **2,746/3,042 lines**, **1,231/1,468 native branch outcomes**,
+and **351/389 functions**. No previously covered lines, functions, or normalized
+function-scoped V8 segments are lost. Native branch identifiers can vary, so
+the comparison uses source-offset partitions as well as reporting native
+totals. The maintained coverage collector now supports this cross-check with
+`--compare`; its self-check includes detecting a lost source region.
+
+```sh
+node scripts/fault-baseline.mjs benchmarks/fault-candidate.json
+node scripts/coverage-overlap.mjs --verify
+node scripts/coverage-overlap.mjs --compare BASELINE_WORKSPACE --output benchmarks/fault-coverage.json
+```
+
+Use the preserved local `sibling-context-2026-10-25` as `BASELINE_WORKSPACE`
+for this uncommitted control. Fresh control/candidate fault reports, assertion
+logs, coverage comparison, and candidate test/collector snapshots remain in
+ignored `benchmarks/`. Broader faults and alternate execution orders were not
+measured.
+
+## 8. Keep transaction-status bookkeeping cheap as history grows
+
+Borrowed from Hyperion hill #8. Measure the existing monitor's complete `sync`
+path with 100, 1,000 and 10,000 cached transaction IDs distributed across 100
+visible blocks. Use settled cache hits and a separate turnover case replacing
+ten blocks per sync. Keep the production 300-block retention cap, 500-item
+queue cap, and request policy. A fetch double must reject any unexpected RPC.
+
+**Score and target:** Reduce 10,000-ID per-sync p95 by 30%, with no repeatable
+100-ID regression above 5%. Fix seven warmed trials of 200 syncs per case.
+Check exact status identities, retained blocks, queue state, and eviction after
+every turnover; no dropped history or deferred unbounded cleanup. Record
+instrumented scan counts separately from timing. Keep sampled heap under
+128 MiB and post-GC growth across the last three trials below 4 MiB. This is
+monitor bookkeeping, not a replacement for the whole-path window replay guard.
+
+**Baseline, 2026-10-25:** Same `0b882ed` plus block-size working tree and Node
+24.16.0. Seven warmed trials per case measure 200 syncs each, with correctness
+assertions outside the sync timer. The table reports the median of trial p95s;
+all identities, retention, statuses, queue checks, and zero-RPC checks pass.
+
+| Visible transaction IDs | Settled p95 | Turnover p95 |
+| --- | ---: | ---: |
+| 100 | 0.041 ms | 0.051 ms |
+| 1,000 | 0.167 ms | 0.197 ms |
+| 10,000 | 0.888 ms | 1.102 ms |
+
+Separate instrumentation at 10,000 IDs counts 10,000 cache membership checks,
+10,000 visited cache keys and 200 visited retained values for settled syncs;
+turnover counts 12,000 / 11,000 / 220. Timed trials have no scan wrappers.
+Completed off-screen blocks disappear on the current sync, while their cache
+entries disappear on the next sync; the checks preserve that existing behavior.
+
+**Guard failure:** Largest measured sampled heap is **128.53 MiB** in 10,000-ID
+turnover, above the unchanged **128 MiB** ceiling. Settled 10,000-ID peak is
+123.28 MiB. All post-GC growth guards pass; the turnover case's final three
+post-GC samples are 5.26 / 5.27 / 5.27 MiB. Sampling includes harness fixtures
+and assertions; this is not isolated application memory or evidence of a leak.
+The runner writes the complete report before exiting nonzero for guard
+violations. The initial fail-fast attempt was not used as the full baseline.
+No performance improvement or guard pass is claimed from this pass.
+
+```sh
+mkdir -p benchmarks
+node --expose-gc scripts/cache-baseline.mjs benchmarks/cache-baseline.json
+# A nonzero exit records a resource-guard failure; inspect the saved report.
+```
+
+## 9. Reach the first useful CLI output sooner
+
+Borrowed from Hyperion hill #9. Start fresh Node subprocesses against controlled
+RPC responses and measure launch to the first correct block JSON record and
+first dashboard frame containing that block. A connecting frame does not count.
+Use explicit-node selection to isolate module/startup cost; measure automatic
+Beacon selection separately before making any claim about default startup.
+
+**Score and target:** Reduce startup p95 by 20% without a repeatable first/second
+block or dashboard-input regression above 5%, extra requests, or lost output.
+Freeze Node version, 160×50 terminal dimensions, fixtures and 10 ms RPC latency;
+warm once per mode then measure 21 alternating fresh-process runs per mode.
+Include module import cost; report follow and dashboard separately, with process
+exit and request counts. Dashboard uses a TTY-capable fixture; real terminal
+painting and cold filesystem caches are outside the initial baseline. Keep the
+dependency-free runtime and existing cancellation and error behavior.
+
+**Baseline, 2026-10-25:** Same runtime context, Node 24.16.0, warm filesystem
+cache. Each mode has one unmeasured warmup and 21 alternating measured fresh
+processes. The preload fixture blocks unexpected network calls, supplies 10 ms
+RPC bodies, and simulates TTY properties/input for the dashboard. Launch timing
+includes Node, preload, module imports, rendering and IPC delivery; it is not
+an isolated import benchmark. p95 is the nearest-rank 20th of 21 samples.
+
+| Mode | First useful block p95 | Second block p95 from launch | HTTP calls | Exit |
+| --- | ---: | ---: | ---: | --- |
+| JSON follow | 74.56 ms | 99.20 ms | 8 | 0 in every run |
+| Dashboard | 87.50 ms | 111.86 ms | 12 | 0 in every run |
+
+Dashboard keypress-to-handler-completion p95 is **0.260 ms**, including its
+synchronous drawing work. Both modes check block numbers 10,000 and 10,001 and
+the expected producer, exactly two block requests, and successful shutdown;
+dashboard runs also check terminal restoration. Connecting output never earns
+a completion marker. Useful-frame detection inspects emitted ANSI text rather
+than an actual terminal screen. Automatic Beacon discovery, cold filesystem
+caches, and real terminal painting remain unmeasured. No startup change was
+made; the first-output targets are 59.65 ms follow and 70.00 ms dashboard.
+
+```sh
+mkdir -p benchmarks
+node scripts/startup-baseline.mjs benchmarks/startup-baseline.json
+```
+
+The fault, cache, and startup runners write their reports under ignored
+`benchmarks/` when invoked as above. To rerun them, use a checkout containing
+the block-size cache and run `npm ci` and `npm run build` first. The local
+`sibling-context-2026-10-25` snapshot with its SHA-256 manifest preserves the
+inputs for the original measurements.
 
 ## Renderer remains parked
 
